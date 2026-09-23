@@ -16,3 +16,6 @@ coverage/
 .local/
 test-results/
 playwright-report/
+.history
+.vscode
+.claude
