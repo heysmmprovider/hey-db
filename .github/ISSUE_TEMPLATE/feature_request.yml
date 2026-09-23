@@ -1,0 +1,35 @@
+name: Feature request
+description: Suggest an improvement or a new workflow for hey db.
+title: "[Feature]: "
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for helping shape hey db! Please check existing issues first.
+        Use synthetic or redacted examples only. Do not include credentials, connection strings, private hostnames, database dumps, or customer data.
+  - type: textarea
+    id: use-case
+    attributes:
+      label: What are you trying to do?
+      description: Describe the task and what gets in your way today.
+      placeholder: When I work with PostgreSQL, I would like to…
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: How would you like hey db to help?
+      description: Explain the behavior you would expect. Mockups or synthetic SQL examples are welcome.
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives or workarounds
+      description: How do you handle this today? Are there other approaches worth considering?
+  - type: input
+    id: platform
+    attributes:
+      label: Platform and app version
+      description: If relevant, include your operating system, chip architecture, and hey db version.
+      placeholder: macOS 13, Apple Silicon, hey db 0.1.0
