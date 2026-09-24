@@ -32,9 +32,17 @@ Local development builds do not require Apple signing credentials. Public macOS 
 
 ## Release packaging
 
-The ready-to-install preview lives in [`downloads/`](../downloads/README.md), alongside its SHA-256 checksum. Use that same versioned file when publishing a download on [heymydb.com](https://heymydb.com).
+The ready-to-install preview lives in [`downloads/`](../downloads/README.md), alongside its SHA-256 checksum. The stable installer filename is `hey-db-macos-arm64.dmg`. Use that same file when publishing a download on [heymydb.com](https://heymydb.com).
 
-When replacing the installer, keep the version in `package.json`, `src-tauri/Cargo.toml`, `src-tauri/tauri.conf.json`, the lockfiles, the filename, and the documentation in sync. Rebuild, test the app, and regenerate the checksum from the new file. Update the README download link as part of the same change.
+When publishing a new app version, keep the version in `package.json`, `src-tauri/Cargo.toml`, `src-tauri/tauri.conf.json`, the lockfiles, and any displayed version in the documentation or website in sync. The stable download filename does not change between versions. Rebuild and test the app, then copy the new DMG to `downloads/hey-db-macos-arm64.dmg` and regenerate its checksum:
+
+```sh
+cd downloads
+shasum -a 256 hey-db-macos-arm64.dmg > SHA256SUMS
+shasum -a 256 -c SHA256SUMS
+```
+
+Commit the installer and checksum together. Existing links continue to serve the new installer after pushing to `main`; no website link change is needed for subsequent updates. Historical versioned installers may remain alongside it.
 
 The current preview is ad-hoc signed, not Apple-notarized. For a verified developer identity and standard macOS distribution, use a Developer ID certificate and Apple notarization instead of the ad-hoc signing override above. Keep signing credentials outside source control.
 

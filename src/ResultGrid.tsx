@@ -1,10 +1,10 @@
-import { useMemo, useRef, useState } from 'react';
+import { memo, useMemo, useRef, useState } from 'react';
 import { useVirtualizer } from '@tanstack/react-virtual';
 import { KeyRound, LockKeyhole } from 'lucide-react';
 import type { CellEdit, QueryResult } from './types';
 import { cellKey } from './data';
 
-export default function ResultGrid({ result, edits, onEdit, disabled, onSelect }: { result: QueryResult; edits: CellEdit[]; onEdit: (edit: CellEdit) => void; disabled: boolean; onSelect: (cell: { row: number; column: number } | null) => void }) {
+function ResultGrid({ result, edits, onEdit, disabled, onSelect }: { result: QueryResult; edits: CellEdit[]; onEdit: (edit: CellEdit) => void; disabled: boolean; onSelect: (cell: { row: number; column: number } | null) => void }) {
   const viewport = useRef<HTMLDivElement>(null);
   const [selected, setSelected] = useState<string | null>(null);
   const [editing, setEditing] = useState<{ row: number; column: number; value: string } | null>(null);
@@ -27,7 +27,7 @@ export default function ResultGrid({ result, edits, onEdit, disabled, onSelect }
         {horizontal.getVirtualItems().map(col => {
           const key = cellKey(row.index, col.index); const changed = changes.has(key); const value = changed ? changes.get(key)! : result.rows[row.index][col.index]; const isEditing = editing?.row === row.index && editing.column === col.index;
           return <div role="gridcell" aria-colindex={col.index + 2} aria-readonly={!result.columns[col.index].editable} aria-selected={selected === key} tabIndex={0} key={col.key} className={`grid-cell ${changed ? 'changed' : ''} ${selected === key ? 'selected' : ''} ${value === null ? 'null-value' : ''}`} style={{ left: col.start, width: col.size }} onClick={() => select(row.index, col.index)} onDoubleClick={() => begin(row.index, col.index)} onKeyDown={e => { if (!isEditing && (e.key === 'Enter' || e.key === 'F2')) { e.preventDefault(); begin(row.index, col.index); } }} title={value === null ? 'NULL' : value}>
-            {isEditing ? <input aria-label={`Edit ${result.columns[col.index].name}, row ${row.index + 1}`} autoFocus value={editing.value} onChange={e => setEditing({ ...editing, value: e.target.value })} onBlur={commit} onKeyDown={e => { if (e.key === 'Enter') { e.preventDefault(); commit(); } if (e.key === 'Escape') { e.preventDefault(); setEditing(null); } e.stopPropagation(); }} /> : <><span>{value === null ? 'NULL' : value === '' ? <span className="empty-value">empty string</span> : value}</span>{!result.columns[col.index].editable && result.columns[col.index].primaryKey && <LockKeyhole size={10} className="cell-lock" />}</>}
+            {isEditing ? <input autoCorrect="off" autoCapitalize="none" spellCheck={false} aria-label={`Edit ${result.columns[col.index].name}, row ${row.index + 1}`} autoFocus value={editing.value} onChange={e => setEditing({ ...editing, value: e.target.value })} onBlur={commit} onKeyDown={e => { if (e.key === 'Enter') { e.preventDefault(); commit(); } if (e.key === 'Escape') { e.preventDefault(); setEditing(null); } e.stopPropagation(); }} /> : <><span>{value === null ? 'NULL' : value === '' ? <span className="empty-value">empty string</span> : value}</span>{!result.columns[col.index].editable && result.columns[col.index].primaryKey && <LockKeyhole size={10} className="cell-lock" />}</>}
           </div>;
         })}
       </div>)}
@@ -35,3 +35,5 @@ export default function ResultGrid({ result, edits, onEdit, disabled, onSelect }
     {!result.rows.length && <div className="no-rows">No rows matched this query.</div>}
   </div>;
 }
+
+export default memo(ResultGrid);

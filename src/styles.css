@@ -51,3 +51,17 @@ kbd { font-family:inherit; color:var(--muted); font-size:11px; }
 
 :root[data-theme="dark"]{--bg:#191b20;--panel:#23262d;--sidebar:#202228;--chrome:#22242a;--text:#e4e6eb;--muted:#a0a6b2;--faint:#717885;--line:#33373f;--hover:#2b3039;--accent:#9ab8ff;--accent-solid:#5077dd;--accent-soft:#293853;--selection:#344868;--green:#8cc4a8;--green-soft:#202e29;--amber:#e8c87e;--amber-soft:#393225;--danger:#e99999;--danger-soft:#36262a;--syntax-key:#c29ae2;--syntax-value:#91c6b5;--editor-line:#1d2026;}
 @media(prefers-color-scheme:dark){:root[data-theme="system"],:root:not([data-theme]){--bg:#191b20;--panel:#23262d;--sidebar:#202228;--chrome:#22242a;--text:#e4e6eb;--muted:#a0a6b2;--faint:#717885;--line:#33373f;--hover:#2b3039;--accent:#9ab8ff;--accent-solid:#5077dd;--accent-soft:#293853;--selection:#344868;--green:#8cc4a8;--green-soft:#202e29;--amber:#e8c87e;--amber-soft:#393225;--danger:#e99999;--danger-soft:#36262a;--syntax-key:#c29ae2;--syntax-value:#91c6b5;--editor-line:#1d2026;}}
+
+.database-tree{flex:1;min-height:0;overflow:auto;padding:4px 8px 16px}
+.database-row{display:flex;align-items:center;border-radius:5px;gap:1px;padding:3px 0}
+.database-row.active{background:var(--accent-soft);color:var(--accent)}
+.database-row .icon-button{width:24px;height:26px;flex:none}
+.database-name{flex:1;min-width:0;justify-content:flex-start;text-align:left;padding:6px 2px;font-size:12px}
+.database-name svg{flex:none}.database-name span{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.database-schemas{padding-left:9px}.database-hint{padding:4px 12px 8px 24px;font-size:11px;line-height:1.6;color:var(--muted)}
+.export-controls{position:relative;display:flex;align-items:center;gap:5px}
+.export-settings-button{border-left:1px solid var(--line);border-radius:0;padding-left:9px}
+.export-popover{position:absolute;right:0;top:calc(100% + 8px);z-index:20;min-width:170px;padding:6px;border:1px solid var(--line);border-radius:7px;background:var(--panel);box-shadow:0 8px 25px #0002}
+.export-popover button{display:flex;width:100%;justify-content:flex-start;padding:9px;border-radius:4px;font-size:12px}
+.export-popover button:hover{background:var(--hover)}.export-popover label{display:flex;flex-direction:column;gap:8px;padding:6px;font-size:11px;color:var(--muted)}
+.export-popover select{width:100%;font-size:12px}

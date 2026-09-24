@@ -2,7 +2,7 @@
 
 Download from **[heymydb.com](https://heymydb.com)** or get the ready-to-install file here:
 
-**[hey db 0.1.0 — macOS, Apple Silicon (.dmg)](hey-db-0.1.0-macos-arm64.dmg?raw=true)**
+**[hey db — macOS, Apple Silicon (.dmg)](hey-db-macos-arm64.dmg?raw=true)**
 
 Requires an M-series Mac running macOS 13 Ventura or later. No Node.js, Rust, PostgreSQL server installation, or source build is needed on your Mac to run the app and connect to an existing database.
 
@@ -20,7 +20,7 @@ Download [SHA256SUMS](SHA256SUMS?raw=true) into the same folder as the installer
 shasum -a 256 -c SHA256SUMS
 ```
 
-The result should be `hey-db-0.1.0-macos-arm64.dmg: OK`. This checks the file against the published checksum; it does not replace Apple notarization.
+The result should be `hey-db-macos-arm64.dmg: OK`. This checks the file against the published checksum; it does not replace Apple notarization.
 
 The disk image contains the app, including the synthetic demo. It does not include saved connections, credentials, or a database server. Intel Mac, Windows, and Linux installers are not included in this release.
 

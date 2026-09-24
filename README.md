@@ -14,7 +14,7 @@ Download hey db from **[heymydb.com](https://heymydb.com)**, or use the installe
 
 | Download | Requirements |
 | --- | --- |
-| [hey db 0.1.0 for Mac — Apple Silicon (.dmg)](downloads/hey-db-0.1.0-macos-arm64.dmg?raw=true) | macOS 13 Ventura or later; an M-series Mac |
+| [hey db for Mac — Apple Silicon (.dmg)](downloads/hey-db-macos-arm64.dmg?raw=true) | macOS 13 Ventura or later; an M-series Mac |
 
 1. Open the downloaded `.dmg` file.
 2. Drag **hey db** into **Applications**.
