@@ -1,9 +1,10 @@
 use crate::model::*;
 use bytes::BytesMut;
 use sqlparser::{
-    ast::{Expr, GroupByExpr, SelectItem, SetExpr, Statement, TableFactor},
+    ast::{Expr, GroupByExpr, Query, SelectItem, SetExpr, Statement, TableFactor},
     dialect::PostgreSqlDialect,
     parser::Parser,
+    tokenizer::Token,
 };
 use std::collections::{BTreeMap, HashSet};
 use tokio_postgres::types::{Format, IsNull, ToSql, Type};
@@ -20,14 +21,75 @@ pub fn qualified(target: &Target) -> String {
 }
 
 pub fn parse_statement(sql: &str) -> Result<Statement, String> {
-    let mut statements = Parser::parse_sql(&PostgreSqlDialect {}, sql)
-        .map_err(|e| format!("SQL could not be parsed: {e}"))?;
+    let mut statements = parse_script(sql)?;
     if statements.len() != 1 {
         return Err(
             "Run one SQL statement at a time. Select the statement you want to execute.".into(),
         );
     }
-    let stmt = statements.remove(0);
+    Ok(statements.remove(0).1)
+}
+
+// Use the parser's statement boundaries, then slice the original SQL. Reprinting
+// an AST can change PostgreSQL literals; splitting on ';' breaks quoted bodies.
+pub fn parse_script(sql: &str) -> Result<Vec<(&str, Statement)>, String> {
+    if sql.len() > 1024 * 1024 {
+        return Err("SQL is limited to 1 MiB per run.".into());
+    }
+    let dialect = PostgreSqlDialect {};
+    let mut parser = Parser::new(&dialect)
+        .try_with_sql(sql)
+        .map_err(|e| format!("SQL could not be parsed: {e}"))?;
+    let mut statements = Vec::new();
+    let mut chars = sql.char_indices().peekable();
+    let (mut line, mut column) = (1, 1);
+    let mut offset = |location: sqlparser::tokenizer::Location| {
+        while (line, column) < (location.line, location.column) {
+            let Some((_, ch)) = chars.next() else { break };
+            if ch == '\n' {
+                line += 1;
+                column = 1;
+            } else {
+                column += 1;
+            }
+        }
+        chars.peek().map_or(sql.len(), |(index, _)| *index)
+    };
+    loop {
+        while parser.consume_token(&Token::SemiColon) {}
+        let first = parser.peek_token();
+        if first.token == Token::EOF {
+            break;
+        }
+        if statements.len() == 1000 {
+            return Err("Run at most 1,000 statements at a time.".into());
+        }
+        let start = offset(first.span.start);
+        let number = statements.len() + 1;
+        let ast = parser.parse_statement().map_err(|e| {
+            format!("Statement {number} could not be parsed: {e}. No statements were executed.")
+        })?;
+        validate_statement(&ast)
+            .map_err(|e| format!("Statement {number}: {e} No statements were executed."))?;
+        let next = parser.peek_token();
+        let end = match next.token {
+            Token::EOF => sql.len(),
+            Token::SemiColon => offset(next.span.start),
+            _ => {
+                return Err(format!(
+                    "Expected a semicolon after statement {number}. No statements were executed."
+                ))
+            }
+        };
+        statements.push((sql[start..end].trim(), ast));
+    }
+    if statements.is_empty() {
+        return Err("Enter at least one SQL statement to run.".into());
+    }
+    Ok(statements)
+}
+
+fn validate_statement(stmt: &Statement) -> Result<(), String> {
     let text = stmt.to_string();
     let first = text.split_whitespace().next().unwrap_or("").to_uppercase();
     if [
@@ -51,9 +113,29 @@ pub fn parse_statement(sql: &str) -> Result<Statement, String> {
     ]
     .contains(&first.as_str())
     {
-        return Err("This first version runs each statement in its own transaction. Session commands, COPY, and explicit transaction control are not supported yet.".into());
+        return Err("Each statement runs in its own transaction. Session commands, COPY, and explicit transaction control are not supported yet.".into());
     }
-    Ok(stmt)
+    Ok(())
+}
+
+pub fn can_refresh(stmt: &Statement) -> bool {
+    fn query(value: &Query) -> bool {
+        value
+            .with
+            .as_ref()
+            .is_none_or(|with| with.cte_tables.iter().all(|cte| query(&cte.query)))
+            && body(&value.body)
+    }
+    fn body(expr: &SetExpr) -> bool {
+        match expr {
+            SetExpr::Select(select) => select.into.is_none(),
+            SetExpr::Query(value) => query(value),
+            SetExpr::SetOperation { left, right, .. } => body(left) && body(right),
+            SetExpr::Values(_) | SetExpr::Table(_) => true,
+            _ => false,
+        }
+    }
+    matches!(stmt, Statement::Query(value) if query(value))
 }
 
 pub fn is_plain_select(stmt: &Statement) -> bool {
@@ -227,6 +309,52 @@ pub fn plan(snapshot: &Snapshot, edits: &[CellEdit]) -> Result<Vec<PlannedUpdate
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn refreshes_queries_without_replaying_explicit_writes() {
+        for sql in [
+            "SELECT 1 UNION ALL SELECT 2",
+            "WITH p AS (SELECT 1) SELECT * FROM p",
+            "SELECT * FROM products",
+        ] {
+            assert!(can_refresh(&parse_statement(sql).unwrap()));
+        }
+        for sql in [
+            "UPDATE products SET stock=stock+1 RETURNING *",
+            "SELECT * INTO copied FROM products",
+            "WITH p AS (DELETE FROM products RETURNING *) SELECT * FROM p",
+        ] {
+            assert!(!can_refresh(&parse_statement(sql).unwrap()));
+        }
+    }
+
+    #[test]
+    fn splits_scripts_without_rewriting_postgresql_literals() {
+        let sql = "-- → first;\r\nSELECT 'it''s; okay', E'a\\\';b', $$dollar;value$$ AS \"a;b\"; /* outer; /* inner; */ */ SELECT $tag$→;text$tag$; -- done;";
+        let statements = super::parse_script(sql).unwrap();
+        assert_eq!(statements.len(), 2);
+        assert_eq!(
+            statements[0].0,
+            "SELECT 'it''s; okay', E'a\\\';b', $$dollar;value$$ AS \"a;b\""
+        );
+        assert_eq!(statements[1].0, "SELECT $tag$→;text$tag$");
+        let statements = super::parse_script(";; SELECT '→'; SELECT 'é'; ; -- trailing").unwrap();
+        assert_eq!(statements[1].0, "SELECT 'é'");
+    }
+
+    #[test]
+    fn validates_the_whole_script_before_execution() {
+        for sql in [
+            "-- comment only",
+            ";;",
+            "SELECT 'unterminated",
+            "SELECT 1; BEGIN; SELECT 2",
+            "SELECT 1; SELECT FROM",
+            "SELECT 1 END",
+        ] {
+            assert!(super::parse_script(sql).is_err(), "{sql}");
+        }
+    }
+
     use super::*;
     fn snapshot() -> Snapshot {
         Snapshot {

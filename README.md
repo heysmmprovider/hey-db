@@ -28,7 +28,7 @@ This preview is ad-hoc signed and is **not Apple-notarized**. macOS may block th
 
 - Saved PostgreSQL connections, verified TLS, optional system credential storage, and read-only connections.
 - Schema explorer with table/view discovery, columns, primary keys, and index definitions.
-- SQL tabs, PostgreSQL highlighting, basic schema completion, selected-statement execution, and cancellation.
+- SQL tabs, PostgreSQL highlighting, table and column autocomplete, selected-script execution, and cancellation.
 - A result grid that virtualizes both rows and columns. Integers, decimals, timestamps, and other values remain strings so JavaScript cannot round your data.
 - Inline cell edits, pending-change highlights, discard, parameterized UPDATE previews, and transactional Apply.
 - CSV export of the loaded result, with spreadsheet-formula protection.
@@ -81,9 +81,11 @@ TLS defaults to certificate and hostname verification. The unencrypted option is
 
 ## Current scope
 
-Each Run executes one statement in an application-managed transaction. Explicit transaction/session commands, COPY, and procedures are not supported. Commands that PostgreSQL forbids inside a transaction (such as VACUUM) are therefore not supported yet. There is a 120-second statement timeout and a five-second lock timeout.
+Run executes all statements in the selection, or the whole editor when nothing is selected. Statements run sequentially, each in its own application-managed BEGIN / COMMIT transaction. A failure, cancellation, or result limit stops the script; earlier commits remain committed. SQL is validated before execution, with a limit of 1 MiB and 1,000 statements per run. The grid shows the last result, and execution details list completed statements with row counts and timings. Refresh reruns only the final query, never preceding statements or explicit writes. Explicit transaction/session commands, COPY, and procedures are not supported. Commands that PostgreSQL forbids inside a transaction (such as VACUUM) are therefore not supported yet. There is a 120-second statement timeout and a five-second lock timeout.
 
 Results are limited to 1,000 rows and 8 MiB of retained values. When the limit is reached, the remainder is canceled and that query's transaction is rolled back; oversized write results return an error without committing. A single server row can still require transient memory before its size is checked. Use WHERE, ORDER BY, and LIMIT to browse larger datasets. CSV exports include only loaded rows. Queries are serialized per connection; run separate sessions for independent work.
+
+Table and column suggestions load when connecting or selecting a database and refresh after execution or a database refresh. Type a table name, `schema.`, or a table alias followed by `.` to see matches; press Ctrl + Space to open suggestions manually. Unqualified columns are suggested from tables referenced in the current SELECT, UPDATE, INSERT, or DELETE, including joins.
 
 There is no persistent tab restore, full SQL semantic analysis, grid insertion/deletion, SQL file management, or support for other database engines yet. The Rust database boundary keeps future adapters separate from the interface.
 

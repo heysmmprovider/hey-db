@@ -32,8 +32,8 @@ async fn run_query(
     connection_id: String,
     sql: String,
     operation_id: String,
-) -> Result<QueryResult, String> {
-    state.query(&connection_id, &sql, &operation_id).await
+) -> Result<ScriptResult, String> {
+    state.script(&connection_id, &sql, &operation_id).await
 }
 #[tauri::command]
 async fn cancel_query(

@@ -53,6 +53,28 @@ pub struct QueryResult {
     pub table: Option<String>,
 }
 
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StatementOutcome {
+    pub number: usize,
+    pub command: String,
+    pub affected_rows: u64,
+    pub returned_rows: usize,
+    pub elapsed_ms: u128,
+    pub committed: bool,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ScriptResult {
+    pub statements: Vec<StatementOutcome>,
+    pub total_statements: usize,
+    pub result: Option<QueryResult>,
+    // Refresh only the final SELECT, never replay the preceding writes.
+    pub refresh_sql: Option<String>,
+    pub error: Option<String>,
+}
+
 #[derive(Clone)]
 pub struct SourceColumn {
     pub name: String,
@@ -99,6 +121,8 @@ pub struct TableInfo {
     pub schema: String,
     pub name: String,
     pub kind: String,
+    pub columns: Vec<String>,
+    pub visible: bool,
 }
 
 #[derive(Serialize)]

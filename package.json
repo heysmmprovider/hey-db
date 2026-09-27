@@ -1,6 +1,6 @@
 {
   "name": "hey-db",
-  "version": "0.1.1",
+  "version": "0.1.3",
   "license": "MIT",
   "private": true,
   "type": "module",
@@ -10,7 +10,9 @@
     "preview": "vite preview --host 127.0.0.1",
     "tauri": "tauri",
     "desktop": "tauri dev",
-    "test": "vitest run",
+    "release": "node scripts/release.mjs",
+    "test": "vitest run && npm run test:release",
+    "test:release": "node --test scripts/release-tests.mjs",
     "test:rust": "cargo test --manifest-path src-tauri/Cargo.toml",
     "test:database": "node scripts/test-database.mjs"
   },

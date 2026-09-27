@@ -6,7 +6,10 @@ use futures_util::{pin_mut, TryStreamExt};
 use postgres_native_tls::MakeTlsConnector;
 use std::{
     collections::{HashMap, HashSet, VecDeque},
-    sync::{Arc, Mutex as SyncMutex},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc, Mutex as SyncMutex,
+    },
     time::{Duration, Instant},
 };
 use tokio::sync::{Mutex, RwLock};
@@ -14,7 +17,12 @@ use tokio_postgres::{types::ToSql, CancelToken, Client, Config, SimpleQueryMessa
 
 const MAX_ROWS: usize = 1000;
 const MAX_BYTES: usize = 8 * 1024 * 1024;
-type ActiveOperation = SyncMutex<Option<(String, CancelToken)>>;
+struct Operation {
+    id: String,
+    token: CancelToken,
+    canceled: Arc<AtomicBool>,
+}
+type ActiveOperation = SyncMutex<Option<Operation>>;
 struct Session {
     client: Mutex<Client>,
     profile: Profile,
@@ -110,7 +118,10 @@ impl Database {
                 .lock()
                 .map_err(|_| "Connection is busy.")?
                 .as_ref()
-                .map(|(_, token)| token.clone());
+                .map(|active| {
+                    active.canceled.store(true, Ordering::SeqCst);
+                    active.token.clone()
+                });
             if let Some(token) = token {
                 let _ = token.cancel_query(tls()?).await;
             }
@@ -124,7 +135,11 @@ impl Database {
             .lock()
             .map_err(|_| "Connection is busy.")?
             .as_ref()
-            .and_then(|(active, token)| (active == operation).then(|| token.clone()));
+            .filter(|active| active.id == operation)
+            .map(|active| {
+                active.canceled.store(true, Ordering::SeqCst);
+                active.token.clone()
+            });
         if let Some(token) = token {
             token.cancel_query(tls()?).await.map_err(error)?;
         }
@@ -136,7 +151,7 @@ impl Database {
             .client
             .try_lock()
             .map_err(|_| "Wait for the running query to finish.")?;
-        let rows=client.query("SELECT c.oid,n.nspname,c.relname,c.relkind::text FROM pg_catalog.pg_class c JOIN pg_catalog.pg_namespace n ON n.oid=c.relnamespace WHERE c.relkind IN ('r','p','v','m') AND n.nspname NOT IN ('pg_catalog','information_schema') AND n.nspname NOT LIKE 'pg_toast%' AND n.nspname NOT LIKE 'pg_temp%' ORDER BY n.nspname,c.relname LIMIT 10000",&[]).await.map_err(error)?;
+        let rows=client.query("SELECT c.oid,n.nspname,c.relname,c.relkind::text,ARRAY(SELECT a.attname::text FROM pg_catalog.pg_attribute a WHERE a.attrelid=c.oid AND a.attnum>0 AND NOT a.attisdropped ORDER BY a.attnum),pg_catalog.pg_table_is_visible(c.oid) FROM pg_catalog.pg_class c JOIN pg_catalog.pg_namespace n ON n.oid=c.relnamespace WHERE c.relkind IN ('r','p','v','m') AND n.nspname NOT IN ('pg_catalog','information_schema') AND n.nspname NOT LIKE 'pg_toast%' AND n.nspname NOT LIKE 'pg_temp%' ORDER BY n.nspname,c.relname LIMIT 10000",&[]).await.map_err(error)?;
         Ok(rows
             .iter()
             .map(|r| TableInfo {
@@ -144,6 +159,8 @@ impl Database {
                 schema: r.get(1),
                 name: r.get(2),
                 kind: r.get(3),
+                columns: r.get(4),
+                visible: r.get(5),
             })
             .collect())
     }
@@ -176,20 +193,96 @@ impl Database {
         })
     }
     pub async fn query(&self, id: &str, sql: &str, operation: &str) -> Result<QueryResult, String> {
-        if sql.len() > 1024 * 1024 {
-            return Err("SQL is limited to 1 MiB per statement.".into());
+        edits::parse_statement(sql)?;
+        let script = self.script(id, sql, operation).await?;
+        if let Some(error) = script.error {
+            return Err(error);
         }
-        let ast = edits::parse_statement(sql)?;
-        let is_select = matches!(&ast, sqlparser::ast::Statement::Query(_));
+        script.result.ok_or_else(|| "No result returned.".into())
+    }
+    pub async fn script(
+        &self,
+        id: &str,
+        sql: &str,
+        operation: &str,
+    ) -> Result<ScriptResult, String> {
+        let statements = edits::parse_script(sql)?;
         let session = self.session(id).await?;
         let mut client = session
             .client
             .try_lock()
             .map_err(|_| "A query is already running on this connection.")?;
         let token = client.cancel_token();
-        *session.active.lock().map_err(|_| "Connection is busy.")? =
-            Some((operation.into(), token.clone()));
+        let canceled = Arc::new(AtomicBool::new(false));
+        *session.active.lock().map_err(|_| "Connection is busy.")? = Some(Operation {
+            id: operation.into(),
+            token: token.clone(),
+            canceled: canceled.clone(),
+        });
         let _guard = ActiveGuard(&session.active);
+        session.snapshots.lock().await.clear();
+        let mut script = ScriptResult {
+            total_statements: statements.len(),
+            statements: Vec::new(),
+            result: None,
+            refresh_sql: None,
+            error: None,
+        };
+        for (index, (source, ast)) in statements.into_iter().enumerate() {
+            let number = index + 1;
+            if canceled.load(Ordering::SeqCst) {
+                script.error = Some(format!("Stopped before statement {number}: query canceled. Earlier committed statements remain committed."));
+                break;
+            }
+            match Self::execute_statement(&session, &mut client, source, &ast, &token, &canceled)
+                .await
+            {
+                Ok(result) => {
+                    script.statements.push(StatementOutcome {
+                        number,
+                        command: ast
+                            .to_string()
+                            .split_whitespace()
+                            .next()
+                            .unwrap_or("SQL")
+                            .to_owned(),
+                        affected_rows: result.affected_rows,
+                        returned_rows: result.rows.len(),
+                        elapsed_ms: result.elapsed_ms,
+                        committed: !result.truncated,
+                    });
+                    // Refresh the final query only, excluding explicit writes (including write CTEs).
+                    script.refresh_sql = edits::can_refresh(&ast).then(|| source.to_owned());
+                    let truncated = result.truncated;
+                    script.result = Some(result);
+                    if truncated {
+                        if number < script.total_statements {
+                            script.error = Some(format!("Stopped at statement {number}: result limit reached and its transaction was rolled back. Remaining statements were not run. Earlier committed statements remain committed."));
+                        }
+                        break;
+                    }
+                }
+                Err(error) => {
+                    script.error = Some(format!("Statement {number} of {} failed: {error} Remaining statements were not run. Earlier committed statements remain committed.", script.total_statements));
+                    // A failed statement can invalidate a preceding editable snapshot.
+                    script.result = None;
+                    script.refresh_sql = None;
+                    session.snapshots.lock().await.clear();
+                    break;
+                }
+            }
+        }
+        Ok(script)
+    }
+    async fn execute_statement(
+        session: &Session,
+        client: &mut Client,
+        sql: &str,
+        ast: &sqlparser::ast::Statement,
+        token: &CancelToken,
+        canceled: &AtomicBool,
+    ) -> Result<QueryResult, String> {
+        let is_select = matches!(ast, sqlparser::ast::Statement::Query(_));
         let start = Instant::now();
         let tx = client
             .build_transaction()
@@ -210,7 +303,7 @@ impl Database {
             .collect();
         let (mut target, mut reason) = if session.profile.read_only {
             (None, Some("This connection is in read-only mode.".into()))
-        } else if !edits::is_plain_select(&ast) {
+        } else if !edits::is_plain_select(ast) {
             (None,Some("Only direct columns from a single table can be edited. Joins, expressions, aggregates and CTEs are read-only.".into()))
         } else {
             match target_for(&tx, prepared.columns()).await {
@@ -259,6 +352,10 @@ impl Database {
                 return Err("The result exceeded the display limit. The statement was rolled back; no changes were committed.".into());
             }
         } else {
+            if canceled.load(Ordering::SeqCst) {
+                tx.rollback().await.map_err(error)?;
+                return Err("Query canceled. The statement was rolled back.".into());
+            }
             tx.commit().await.map_err(error)?;
         }
         if let Some(ref candidate) = target {

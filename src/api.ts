@@ -1,5 +1,5 @@
 import { invoke, isTauri } from '@tauri-apps/api/core';
-import type { CellEdit, PlannedUpdate, Profile, QueryResult, TableDetails, TableInfo } from './types';
+import type { CellEdit, PlannedUpdate, Profile, QueryResult, ScriptResult, TableDetails, TableInfo } from './types';
 import { DEFAULT_SQL, quoteIdentifier } from './data';
 export const desktop = isTauri();
 export const DEMO_ID = 'demo';
@@ -17,15 +17,15 @@ export const api = {
   deleteProfile: (id: string) => invoke<void>('delete_profile', { id }),
   connect: (profile: Profile, password?: string) => invoke<void>('connect', { profile, password }),
   disconnect: (connectionId: string) => connectionId === DEMO_ID ? Promise.resolve() : invoke<void>('disconnect', { connectionId }),
-  tables: (connectionId: string) => connectionId === DEMO_ID ? Promise.resolve([{ oid: 1, schema: 'public', name: 'products', kind: 'r' }]) : invoke<TableInfo[]>('list_tables', { connectionId }),
+  tables: (connectionId: string) => connectionId === DEMO_ID ? Promise.resolve<TableInfo[]>([{ oid: 1, schema: 'public', name: 'products', kind: 'r', columns: demoColumns.map(c => c.name), visible: true }]) : invoke<TableInfo[]>('list_tables', { connectionId }),
   details: (connectionId: string, oid: number) => connectionId === DEMO_ID ? Promise.resolve<TableDetails>({ columns: demoColumns.map(c => ({ name: c.name, dataType: c.dataType === 'int4' ? 'integer' : 'text', nullable: false, defaultValue: c.name === 'stock' ? '0' : null, primaryKey: c.primaryKey })), indexes: [{ name: 'products_pkey', definition: 'CREATE UNIQUE INDEX products_pkey ON public.products USING btree (id)' }] }) : invoke<TableDetails>('table_details', { connectionId, oid }),
-  query: async (connectionId: string, sql: string, operationId: string): Promise<QueryResult> => {
-    if (connectionId !== DEMO_ID) return invoke<QueryResult>('run_query', { connectionId, sql, operationId });
+  query: async (connectionId: string, sql: string, operationId: string): Promise<ScriptResult> => {
+    if (connectionId !== DEMO_ID) return invoke<ScriptResult>('run_query', { connectionId, sql, operationId });
     const normalized = sql.trim().replace(/;$/, '').replace(/\s+/g, ' ').toLowerCase();
     const accepted = [DEFAULT_SQL, 'SELECT * FROM "public"."products" LIMIT 1000;', 'SELECT * FROM "public"."products" ORDER BY "id" LIMIT 1000;'].map(s => s.trim().replace(/;$/, '').replace(/\s+/g, ' ').toLowerCase());
     if (!accepted.includes(normalized)) throw new Error('The demo supports its sample query only. Connect to PostgreSQL to run your own SQL.');
     demoSnapshot = { id: crypto.randomUUID(), columns: demoColumns, rows: demoRows.filter(r => normalized.includes("'active'") ? r[2] === 'active' : true).map(r => [...r]), affectedRows: 0, elapsedMs: 0, truncated: false, readOnlyReason: null, table: '"public"."products"' };
-    return structuredClone(demoSnapshot);
+    return { statements: [{ number: 1, command: 'SELECT', affectedRows: demoSnapshot.rows.length, returnedRows: demoSnapshot.rows.length, elapsedMs: 0, committed: true }], totalStatements: 1, result: structuredClone(demoSnapshot), refreshSql: sql, error: null };
   },
   cancel: (connectionId: string, operationId: string) => invoke<void>('cancel_query', { connectionId, operationId }),
   preview: async (connectionId: string, resultId: string, edits: CellEdit[]): Promise<PlannedUpdate[]> => {

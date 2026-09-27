@@ -1,13 +1,13 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { ArrowDownToLine, ArrowRight, CheckCheck, ChevronDown, ChevronRight, CircleHelp, Database, FileCode2, KeyRound, LayoutPanelLeft, LoaderCircle, LockKeyhole, Moon, PanelLeftClose, Play, Plug, Plus, RefreshCw, Search, Settings2, ShieldCheck, Square, Sun, Table2, Undo2, X } from 'lucide-react';
 import type { ReactNode } from 'react';
-import type { SQLNamespace } from '@codemirror/lang-sql';
 import { api, DEMO_ID, demoProfile, desktop } from './api';
 import { DEFAULT_SQL, quoteIdentifier, stageEdit, exportData, type ExportFormat } from './data';
-import type { CellEdit, PlannedUpdate, Profile, QueryResult, TableDetails, TableInfo } from './types';
+import type { CellEdit, PlannedUpdate, Profile, QueryResult, ScriptResult, TableDetails, TableInfo } from './types';
 import SqlEditor from './SqlEditor';
 import type { EditorHandle } from './SqlEditor';
 import ResultGrid from './ResultGrid';
+import { version as appVersion } from '../package.json';
 
 const message = (error: unknown) => error instanceof Error ? error.message : String(error);
 type Tab = { id: string; name: string; sql: string };
@@ -52,6 +52,7 @@ export default function App() {
   const [refreshing, setRefreshing] = useState(false); const [filter, setFilter] = useState(''); const [collapsed, setCollapsed] = useState<Set<string>>(new Set());
   const [tabs, setTabs] = useState<Tab[]>([{ id: 'first', name: 'Query 1', sql: DEFAULT_SQL }]); const [tabId, setTabId] = useState('first');
   const [result, setResult] = useState<QueryResult | null>(null); const [details, setDetails] = useState<TableDetails | null>(null); const [selectedTable, setSelectedTable] = useState<TableInfo | null>(null);
+  const [execution, setExecution] = useState<ScriptResult | null>(null);
   const [edits, setEdits] = useState<CellEdit[]>([]); const [cell, setCell] = useState<{ row: number; column: number } | null>(null);
   const [busy, setBusy] = useState(false); const [applying, setApplying] = useState(false); const [operation, setOperation] = useState<string | null>(null);
   const [error, setError] = useState(''); const [notice, setNotice] = useState(''); const [view, setView] = useState<'results' | 'structure'>('results');
@@ -90,7 +91,7 @@ export default function App() {
     return () => { disposed = true; unsubscribe?.(); };
   }, [edits.length, busy, applying]);
   const guard = (action: () => void) => { if (busy || applying || refreshing || inFlight.current) return; if (edits.length) setDiscard(() => action); else action(); };
-  const resetResult = () => { setResult(null); setEdits([]); setCell(null); setDetails(null); setSelectedTable(null); setError(''); setNotice(''); setView('results'); };
+  const resetResult = () => { setResult(null); setExecution(null); lastSql.current = ''; setEdits([]); setCell(null); setDetails(null); setSelectedTable(null); setError(''); setNotice(''); setView('results'); };
   const ensureConnected = useCallback(async (profile: Profile) => {
     if (profile.id === DEMO_ID || sessions.current.has(profile.id)) return;
     try { await api.connect(profile); }
@@ -116,13 +117,26 @@ export default function App() {
     if (edits.length && !ignoreEdits) { setError('Apply or discard your pending changes before running another query.'); return; }
     const sql = sqlOverride ?? (editor.current?.selection().trim() || currentTab.sql);
     if (!sql.trim()) return;
-    const operationId = crypto.randomUUID(); inFlight.current = true; setBusy(true); setOperation(operationId); setError(''); setNotice(''); setCell(null);
-    try { await ensureConnected(profile); const data = await api.query(profile.id, sql, operationId); lastSql.current = sql; setResult(data); setEdits([]); setView('results'); setNotice(data.columns.length ? '' : `Statement completed · ${data.affectedRows} row${data.affectedRows === 1 ? '' : 's'} affected`);
-      if (table) { try { setDetails(await api.details(profile.id, table.oid)); } catch (err) { setError(message(err)); } }
+    const operationId = crypto.randomUUID(); inFlight.current = true; setBusy(true); setOperation(operationId); setError(''); setNotice(''); setCell(null); setExecution(null);
+    try {
+      await ensureConnected(profile);
+      const data = await api.query(profile.id, sql, operationId);
+      lastSql.current = data.refreshSql ?? ''; setExecution(data); setResult(data.result); setEdits([]); setView('results');
+      if (data.error) setError(data.error);
+      else if (data.totalStatements > 1) setNotice(`${data.statements.filter(s => s.committed).length} of ${data.totalStatements} statements committed. Showing the last result.`);
+      else if (data.result && !data.result.columns.length) setNotice(`Statement completed · ${data.result.affectedRows} rows affected`);
+      try {
+        const loaded = await api.tables(profile.id); setTableCache(cache => ({ ...cache, [profile.id]: loaded }));
+        const inspected = table ?? (profile.id === active?.id ? selectedTable : null);
+        if (inspected) {
+          const current = loaded.find(item => item.oid === inspected.oid);
+          setSelectedTable(current ?? null); setDetails(current ? await api.details(profile.id, current.oid) : null);
+        }
+      } catch (err) { setError(previous => [previous, `Could not refresh schema: ${message(err)}`].filter(Boolean).join(' ')); }
     }
-    catch (err) { setError(message(err)); setResult(null); }
+    catch (err) { setError(message(err)); setResult(null); lastSql.current = ''; }
     finally { inFlight.current = false; setBusy(false); setOperation(null); }
-  }, [active, currentTab.sql, edits.length, ensureConnected]);
+  }, [active, currentTab.sql, edits.length, ensureConnected, selectedTable]);
   const connect = async (profile: Profile, password?: string) => {
     if (inFlight.current) throw new Error('Wait for the running query.');
     await api.connect(profile, password);
@@ -168,7 +182,6 @@ export default function App() {
     } catch (err) { setError(message(err)); }
   };
   const newTab = () => guard(() => { const id = crypto.randomUUID(); setTabs(previous => [...previous, { id, name: `Query ${previous.length + 1}`, sql: '' }]); setTabId(id); resetResult(); });
-  const completions = useMemo(() => { const schema: Record<string, Record<string, string[]>> = {}; for (const table of tables) { schema[table.schema] ??= {}; schema[table.schema][table.name] = selectedTable?.oid === table.oid && details ? details.columns.map(c => c.name) : []; } return schema as SQLNamespace; }, [tables, selectedTable, details]);
   const pendingRows = new Set(edits.map(e => e.row)).size;
   const switchTheme = () => setAppearance(value => value === 'system' ? 'dark' : value === 'dark' ? 'light' : 'system');
   useEffect(() => { const fn = (event: KeyboardEvent) => { if (event.target instanceof HTMLElement && event.target.closest('dialog')) return; if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === 's') { event.preventDefault(); void preview(); } }; window.addEventListener('keydown', fn); return () => window.removeEventListener('keydown', fn); });
@@ -192,7 +205,7 @@ export default function App() {
             return <div key={profile.id}>
               <div className={`database-row ${active?.id === profile.id ? 'active' : ''}`}>
                 <button className="icon-button" aria-label={`${open ? 'Collapse' : 'Expand'} ${profile.name}`} aria-expanded={open} onClick={() => setExpanded(current => { const next = new Set(current); open ? next.delete(profile.id) : next.add(profile.id); return next; })}>{open ? <ChevronDown size={13} /> : <ChevronRight size={13} />}</button>
-                <button className="database-name" disabled={busy || applying || refreshing} onClick={() => guard(() => selectDatabase(profile))} title={`${profile.database} · ${profile.host}`}><Database size={14} /><span>{profile.name}</span></button>
+                <button className="database-name" disabled={busy || applying || refreshing} onClick={() => guard(() => { selectDatabase(profile); void loadTables(profile); })} title={`${profile.database} · ${profile.host}`}><Database size={14} /><span>{profile.name}</span></button>
                 <button className="icon-button" disabled={busy || applying || refreshing} aria-label={`Refresh ${profile.name}`} title="Connect and refresh tables" onClick={() => guard(() => { selectDatabase(profile); void loadTables(profile); })}><RefreshCw size={12} /></button>
                 {profile.id !== DEMO_ID && <button className="icon-button" disabled={busy || applying || refreshing} aria-label={`Connection settings for ${profile.name}`} title="Connection settings" onClick={() => guard(() => setConnectionDialog({ existing: profile }))}><Settings2 size={12} /></button>}
               </div>
@@ -204,15 +217,15 @@ export default function App() {
           })}
           {!profiles.length && !tableCache[DEMO_ID] && <p className="sidebar-empty">Add a connection to see your databases here.</p>}
         </nav>
-        <div className="sidebar-bottom"><span className="pg-logo"><Database size={13} /></span><span>PostgreSQL</span><span className="version">v0.1.1</span></div>
+        <div className="sidebar-bottom"><span className="pg-logo"><Database size={13} /></span><span>PostgreSQL</span><span className="version">v{appVersion}</span></div>
       </aside>}
       <main className="main">
         <div className="tabbar"><div className="tabs">{tabs.map(tab => <button key={tab.id} className={`query-tab ${tab.id === tabId ? 'active' : ''}`} onClick={() => { if (tab.id !== tabId) guard(() => { setTabId(tab.id); resetResult(); }); }}><FileCode2 size={14} /><span>{tab.name}</span>{tab.id === tabId && edits.length > 0 && <i className="pending-dot" />}</button>)}<button className="icon-button new-tab" onClick={newTab} aria-label="New query" title="New query"><Plus size={16} /></button></div><span className="tab-language">SQL</span></div>
         {!active ? <div className="welcome"><div className="welcome-mark"><Database size={33} strokeWidth={1.5} /></div><div className="eyebrow">A FOCUSED DATABASE WORKSPACE</div><h1>Make yourself at home<br />in your database.</h1><p>Explore your tables, write SQL, and make thoughtful changes.<br />Everything stays on your computer.</p><div className="welcome-actions"><button className="primary-button" onClick={() => setConnectionDialog({})}><Plus size={16} />Connect to PostgreSQL</button><button className="secondary-button" onClick={() => void enterDemo()}>Explore the demo<ArrowRight size={15} /></button></div><div className="welcome-footnote"><ShieldCheck size={14} />No account. No telemetry. Just your workspace.</div></div> : <>
           <div className="query-toolbar"><div className="query-context"><i className={`status-dot ${active.id !== DEMO_ID && !connected.has(active.id) ? 'offline' : ''}`} /><strong>{active.database}</strong><ChevronRight size={12} /><span>{selectedTable?.schema ?? 'public'}</span>{active.readOnly && <span className="readonly-badge"><LockKeyhole size={11} />Read-only</span>}</div><div className="query-actions"><span className="selection-hint">Selected SQL or whole editor</span>{busy ? <button className="stop-button" disabled={applying || active.id === DEMO_ID} onClick={() => { if (operation) void api.cancel(active.id, operation).catch(err => setError(message(err))); }}><Square size={12} fill="currentColor" />Cancel</button> : <button className="run-button" disabled={applying || refreshing || edits.length > 0} onClick={() => void run()}><Play size={13} fill="currentColor" />Run<kbd>⌘ ↵</kbd></button>}</div></div>
-          <section className="editor-pane" style={{ height: editorHeight }} aria-label="Query editor"><SqlEditor ref={editor} value={currentTab.sql} schema={completions} onChange={sql => setTabs(current => current.map(t => t.id === tabId ? { ...t, sql } : t))} onRun={() => void run()} /></section>
+          <section className="editor-pane" style={{ height: editorHeight }} aria-label="Query editor"><SqlEditor ref={editor} value={currentTab.sql} tables={tables} onChange={sql => setTabs(current => current.map(t => t.id === tabId ? { ...t, sql } : t))} onRun={() => void run()} /></section>
           <div className="pane-divider" role="separator" aria-label="Resize SQL editor" aria-orientation="horizontal" tabIndex={0} onKeyDown={e => { if (e.key === 'ArrowUp' || e.key === 'ArrowDown') { e.preventDefault(); setEditorHeight(h => Math.max(110, Math.min(window.innerHeight - 340, h + (e.key === 'ArrowUp' ? -20 : 20)))); } }} onPointerDown={e => { e.currentTarget.setPointerCapture(e.pointerId); }} onPointerMove={e => { if (e.currentTarget.hasPointerCapture(e.pointerId)) setEditorHeight(h => Math.max(110, Math.min(window.innerHeight - 340, h + e.movementY))); }} onPointerUp={e => e.currentTarget.releasePointerCapture(e.pointerId)}><span /></div>
-          <section className="results-pane" aria-label="Results workspace"><div className="results-toolbar"><div className="result-tabs"><button className={view === 'results' ? 'active' : ''} onClick={() => setView('results')}><Table2 size={14} />Results{result && <span className="count">{result.rows.length.toLocaleString()}</span>}</button><button className={view === 'structure' ? 'active' : ''} disabled={!details} onClick={() => setView('structure')}>Structure</button></div><div className="result-actions">{cell && result?.columns[cell.column].editable && <button className="text-button" disabled={busy || applying} onClick={() => stage({ ...cell, value: null })}>Set NULL</button>}<button className="icon-button" aria-label="Refresh results" title="Refresh results" disabled={!result || busy || applying || edits.length > 0} onClick={() => void run(lastSql.current)}><RefreshCw size={14} /></button><div className="export-controls" ref={exportControls}>
+          <section className="results-pane" aria-label="Results workspace"><div className="results-toolbar"><div className="result-tabs"><button className={view === 'results' ? 'active' : ''} onClick={() => setView('results')}><Table2 size={14} />Results{result && <span className="count">{result.rows.length.toLocaleString()}</span>}</button><button className={view === 'structure' ? 'active' : ''} disabled={!details} onClick={() => setView('structure')}>Structure</button></div><div className="result-actions">{cell && result?.columns[cell.column].editable && <button className="text-button" disabled={busy || applying} onClick={() => stage({ ...cell, value: null })}>Set NULL</button>}<button className="icon-button" aria-label="Refresh results" title="Refresh results" disabled={!result || !lastSql.current || busy || applying || edits.length > 0} onClick={() => void run(lastSql.current)}><RefreshCw size={14} /></button><div className="export-controls" ref={exportControls}>
                 <button className="text-button" disabled={!result?.columns.length || busy || applying} aria-expanded={exportMenu} onClick={() => { setExportMenu(!exportMenu); setExportSettings(false); }}><ArrowDownToLine size={14} />Export<ChevronDown size={12} /></button>
                 <button className="text-button export-settings-button" aria-label="Export settings" aria-expanded={exportSettings} onClick={() => { setExportSettings(!exportSettings); setExportMenu(false); }}><Settings2 size={13} />{exportFormat.toUpperCase()}</button>
                 {exportMenu && <div className="export-popover"><button onClick={() => void exportResults('file')}>Save file</button><button onClick={() => void exportResults('clipboard')}>Copy Clipboard</button></div>}
@@ -220,6 +233,7 @@ export default function App() {
               </div></div></div>
           {error && <div className="notice error" role="alert"><span>{error}</span><button className="icon-button" onClick={() => setError('')} aria-label="Dismiss error"><X size={14} /></button></div>}
           {notice && <div className="notice success" role="status"><CheckCheck size={15} /><span>{notice}</span><button className="icon-button" onClick={() => setNotice('')} aria-label="Dismiss notification"><X size={14} /></button></div>}
+          {execution && execution.totalStatements > 1 && <details className="execution-summary"><summary>{execution.statements.filter(s => s.committed).length} / {execution.totalStatements} statements committed · Execution details</summary><ol>{execution.statements.map(statement => <li key={statement.number}><strong>{statement.number}. {statement.command}</strong><span>{statement.committed ? 'Committed' : 'Rolled back (result limit)'} · {statement.returnedRows ? `${statement.returnedRows} rows returned` : `${statement.affectedRows} rows affected`} · {statement.elapsedMs} ms</span></li>)}</ol></details>}
           {result?.truncated && <div className="notice warning">Showing up to 1,000 rows / 8 MiB. Remaining results were canceled. Use LIMIT and filters to narrow your query.</div>}
           {edits.length > 0 && <div className="pending-bar"><span><i className="pending-dot" /><strong>{edits.length} pending {edits.length === 1 ? 'change' : 'changes'}</strong><small>across {pendingRows} {pendingRows === 1 ? 'row' : 'rows'}</small></span><div><button className="text-button" disabled={applying} onClick={() => setDiscard(() => () => { setEdits([]); setNotice('Pending changes discarded.'); })}><Undo2 size={14} />Discard</button><button className="apply-button" disabled={applying || busy} onClick={() => void preview()}><Play size={12} fill="currentColor" />Apply changes<kbd>⌘ S</kbd></button></div></div>}
           {view === 'structure' && details ? <div className="structure-view"><table><thead><tr><th>Column</th><th>Type</th><th>Nullable</th><th>Default</th></tr></thead><tbody>{details.columns.map(column => <tr key={column.name}><td>{column.primaryKey && <KeyRound size={12} className="key-icon" />}{column.name}</td><td><code>{column.dataType}</code></td><td>{column.nullable ? 'Yes' : 'No'}</td><td><code>{column.defaultValue ?? '—'}</code></td></tr>)}</tbody></table><h3>Indexes</h3>{details.indexes.map(index => <div className="index-definition" key={index.name}><strong>{index.name}</strong><code>{index.definition}</code></div>)}</div> : result?.columns.length ? <ResultGrid key={result.id} result={result} edits={edits} onEdit={stage} onSelect={setCell} disabled={busy || applying} /> : <div className="result-empty">{busy ? <LoaderCircle size={23} className="spin" /> : <Table2 size={25} strokeWidth={1.4} />}<strong>{busy ? 'Running your query…' : result ? 'Statement complete' : 'A place for your results'}</strong><p>{busy ? 'You can cancel a running query at any time.' : result ? `${result.affectedRows} rows affected.` : 'Run a query or choose a table in the sidebar.'}</p>{!busy && !result && <span className="shortcut"><kbd>⌘</kbd><kbd>↵</kbd> to run SQL</span>}</div>}
@@ -231,7 +245,7 @@ export default function App() {
     {connectionDialog && <ConnectionDialog existing={connectionDialog.existing} onClose={() => setConnectionDialog(null)} onConnect={connect} />}
     {discard && <Dialog title="Discard pending changes?" onClose={() => setDiscard(null)}><p className="dialog-copy">You have {edits.length} unapplied cell {edits.length === 1 ? 'edit' : 'edits'}. Discarding restores the loaded values.</p><div className="dialog-footer"><button className="secondary-button" onClick={() => setDiscard(null)}>Keep editing</button><button className="danger-button" onClick={() => { const next = discard; setEdits([]); setDiscard(null); next(); }}>Discard changes</button></div></Dialog>}
     {review && <Dialog title="Review your changes" wide busy={applying} onClose={() => setReview(null)}><div className="review-summary"><span className="review-icon"><CheckCheck size={22} /></span><div><strong>{review.length} {review.length === 1 ? 'row' : 'rows'} will be updated</strong><p>{active?.id === DEMO_ID ? 'Demo only. Changes affect the sample data in this session.' : 'All updates apply together. Conflicts or errors roll back the entire batch.'}</p></div></div><div className="review-list">{review.map((update, index) => <section className="update-preview" key={update.row}><div className="update-title">UPDATE {index + 1}<span>Result row {update.row + 1}</span></div><pre>{update.sql}</pre><div className="parameter-list">{update.parameters.map((value, i) => <div key={i}><code>${i + 1}</code><span className={value === null ? 'null-value' : ''}>{value === null ? 'NULL' : JSON.stringify(value)}</span></div>)}</div></section>)}</div>{reviewError && <div className="form-error" role="alert">{reviewError}</div>}<div className="dialog-footer"><button className="secondary-button" disabled={applying} onClick={() => setReview(null)}>Back to editing</button><button className="primary-button" disabled={applying} onClick={() => void apply()}>{applying ? <LoaderCircle size={14} className="spin" /> : <Play size={13} fill="currentColor" />}{applying ? 'Applying…' : `Apply ${review.length} ${review.length === 1 ? 'update' : 'updates'}`}</button></div></Dialog>}
-    {help && <Dialog title="A few useful things" onClose={() => setHelp(false)}><div className="help-list"><p><kbd>⌘ / Ctrl + Enter</kbd><span>Run selected SQL or the whole editor</span></p><p><kbd>Double-click / Enter</kbd><span>Edit a selected result cell</span></p><p><kbd>⌘ / Ctrl + S</kbd><span>Review and apply pending edits</span></p><p><kbd>Esc</kbd><span>Cancel a cell edit or close a dialog</span></p><hr /><p>Queries run one statement at a time. Results are limited to 1,000 rows or 8 MiB. Include the table’s full primary key to edit direct, single-table results. Keys and generated columns stay read-only.</p><p>SQL and results stay in memory. Saved connections live in your application settings; remembered passwords use your system credential store. Exports contain the loaded rows, without pending edits.</p><p>v0.1.1 · PostgreSQL · Open source</p></div></Dialog>}
+    {help && <Dialog title="A few useful things" onClose={() => setHelp(false)}><div className="help-list"><p><kbd>⌘ / Ctrl + Enter</kbd><span>Run selected SQL or the whole editor</span></p><p><kbd>Ctrl + Space</kbd><span>Show table and column suggestions</span></p><p><kbd>Double-click / Enter</kbd><span>Edit a selected result cell</span></p><p><kbd>⌘ / Ctrl + S</kbd><span>Review and apply pending edits</span></p><p><kbd>Esc</kbd><span>Cancel a cell edit or close a dialog</span></p><hr /><p>Selected statements run in order, each with its own BEGIN / COMMIT. An error or cancellation stops the script; earlier commits remain. The last result is shown, with execution details for each completed statement. Results are limited to 1,000 rows or 8 MiB. Include the table’s full primary key to edit direct, single-table results. Keys and generated columns stay read-only.</p><p>SQL and results stay in memory. Saved connections live in your application settings; remembered passwords use your system credential store. Exports contain the loaded rows, without pending edits.</p><p>v{appVersion} · PostgreSQL · Open source</p></div></Dialog>}
     {!active && error && <div className="global-error" role="alert">{error}<button className="icon-button" aria-label="Dismiss error" onClick={() => setError('')}><X size={14} /></button></div>}
   </div>;
 }

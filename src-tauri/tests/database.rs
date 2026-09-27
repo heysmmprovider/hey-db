@@ -340,3 +340,185 @@ async fn real_postgresql_workflow() {
     db.disconnect(&readonly.id).await.unwrap();
     db.disconnect(&p.id).await.unwrap();
 }
+
+#[tokio::test]
+#[ignore = "requires isolated PostgreSQL; use npm run test:database"]
+async fn scripts_commit_in_order_and_stop_on_failure() {
+    let (db, p, external) = setup().await;
+    let result = db
+        .script(
+            &p.id,
+            r#"
+        -- Separate commits, plus semicolons that are part of values.
+        CREATE TABLE fixture.transactions (id bigint, label text);
+        INSERT INTO fixture.transactions VALUES (txid_current(), 'one; it''s fine');
+        INSERT INTO fixture.transactions VALUES (txid_current(), $tag$two; →$tag$);
+        ALTER TABLE fixture.transactions ADD COLUMN IF NOT EXISTS fulfillment_error varchar;
+        ALTER TABLE fixture.transactions DROP COLUMN IF EXISTS fulfillment_error;
+        SELECT id, label FROM fixture.transactions ORDER BY id;
+    "#,
+            "script",
+        )
+        .await
+        .unwrap();
+    assert!(result.error.is_none(), "{:?}", result.error);
+    assert_eq!(result.total_statements, 6);
+    assert_eq!(result.statements.len(), 6);
+    assert!(result.statements.iter().all(|s| s.committed));
+    let rows = &result.result.as_ref().unwrap().rows;
+    assert_ne!(
+        rows[0][0], rows[1][0],
+        "each INSERT uses a different transaction"
+    );
+    assert_eq!(rows[0][1].as_deref(), Some("one; it's fine"));
+    assert_eq!(rows[1][1].as_deref(), Some("two; →"));
+    assert_eq!(
+        result.refresh_sql.as_deref(),
+        Some("SELECT id, label FROM fixture.transactions ORDER BY id")
+    );
+    let tables = db.tables(&p.id).await.unwrap();
+    let table = tables.iter().find(|t| t.name == "transactions").unwrap();
+    assert_eq!(table.columns, ["id", "label"]);
+    assert!(!table.visible); // fixture is outside the default search_path
+
+    let result = db.script(&p.id, "UPDATE fixture.products SET stock=stock+1 WHERE id=1001; UPDATE fixture.products SET stock=-1 WHERE id=1002; UPDATE fixture.products SET stock=0 WHERE id=1003;", "fail").await.unwrap();
+    assert_eq!(result.statements.len(), 1);
+    assert!(result.error.unwrap().contains("Statement 2 of 3 failed"));
+    assert!(result.result.is_none());
+    let stocks: Vec<i32> = external
+        .query("SELECT stock FROM fixture.products ORDER BY id", &[])
+        .await
+        .unwrap()
+        .iter()
+        .map(|r| r.get(0))
+        .collect();
+    assert_eq!(stocks, [43, 128, 16]);
+    assert!(db
+        .query(&p.id, "SELECT 1", "after-script-error")
+        .await
+        .is_ok());
+
+    // Final results stay editable, and refreshing them cannot replay the UPDATE.
+    let script = db.script(&p.id,
+        "UPDATE fixture.products SET stock=stock+1 WHERE id=1001; SELECT id,name,stock FROM fixture.products ORDER BY id;",
+        "editable-script").await.unwrap();
+    let result = script.result.unwrap();
+    assert!(result.columns[1].editable);
+    db.apply(
+        &p.id,
+        &result.id,
+        &[CellEdit {
+            row: 0,
+            column: 1,
+            value: Some("Renamed".into()),
+        }],
+    )
+    .await
+    .unwrap();
+    let refreshed = db
+        .query(
+            &p.id,
+            script.refresh_sql.as_deref().unwrap(),
+            "refresh-final",
+        )
+        .await
+        .unwrap();
+    assert_eq!(refreshed.rows[0][1].as_deref(), Some("Renamed"));
+    assert_eq!(refreshed.rows[0][2].as_deref(), Some("44"));
+
+    let union = db.script(&p.id,
+        "UPDATE fixture.products SET status='active' WHERE id=1001; SELECT 'products' AS src,id::text AS row FROM fixture.products WHERE id=1001 UNION ALL SELECT 'composite',tenant || '/' || id::text FROM fixture.composite WHERE (tenant,id) IN (('one',1),('two',1));",
+        "verify-union").await.unwrap();
+    assert!(union.error.is_none());
+    assert_eq!(union.result.unwrap().rows.len(), 3);
+    assert!(union.refresh_sql.unwrap().starts_with("SELECT 'products'"));
+
+    // Unsupported transaction control anywhere is rejected before the first write.
+    assert!(db
+        .script(&p.id, "DELETE FROM fixture.products; COMMIT;", "control")
+        .await
+        .is_err());
+    assert_eq!(
+        external
+            .query_one("SELECT count(*) FROM fixture.products", &[])
+            .await
+            .unwrap()
+            .get::<_, i64>(0),
+        3
+    );
+    db.disconnect(&p.id).await.unwrap();
+}
+
+#[tokio::test]
+#[ignore = "requires isolated PostgreSQL; use npm run test:database"]
+async fn scripts_honor_cancellation_limits_and_read_only() {
+    let (db, p, external) = setup().await;
+    let (canceled, cancel_result) = tokio::join!(
+        db.script(&p.id, "UPDATE fixture.products SET stock=stock+1 WHERE id=1001; SELECT pg_sleep(15); DELETE FROM fixture.products;", "cancel-script"),
+        async { tokio::time::sleep(std::time::Duration::from_millis(300)).await; db.cancel(&p.id, "cancel-script").await }
+    );
+    cancel_result.unwrap();
+    let canceled = canceled.unwrap();
+    assert_eq!(canceled.statements.len(), 1);
+    assert!(canceled.error.unwrap().contains("canceled"));
+    assert_eq!(
+        external
+            .query_one("SELECT stock FROM fixture.products WHERE id=1001", &[])
+            .await
+            .unwrap()
+            .get::<_, i32>(0),
+        43
+    );
+    assert_eq!(
+        external
+            .query_one("SELECT count(*) FROM fixture.products", &[])
+            .await
+            .unwrap()
+            .get::<_, i64>(0),
+        3
+    );
+
+    let limited = db
+        .script(
+            &p.id,
+            "SELECT generate_series(1,10000); DELETE FROM fixture.products;",
+            "limit-script",
+        )
+        .await
+        .unwrap();
+    assert_eq!(limited.statements.len(), 1);
+    assert!(!limited.statements[0].committed);
+    assert!(limited.error.unwrap().contains("result limit"));
+    assert!(limited.result.unwrap().truncated);
+    assert!(db.query(&p.id, "SELECT 1", "after-limit").await.is_ok());
+
+    let mut readonly = p.clone();
+    readonly.id = uuid::Uuid::new_v4().to_string();
+    readonly.read_only = true;
+    db.connect(
+        readonly.clone(),
+        std::env::var("HEY_DB_TEST_PASSWORD").unwrap(),
+    )
+    .await
+    .unwrap();
+    let denied = db
+        .script(
+            &readonly.id,
+            "SELECT 1; DELETE FROM fixture.products; SELECT 2;",
+            "readonly-script",
+        )
+        .await
+        .unwrap();
+    assert_eq!(denied.statements.len(), 1);
+    assert!(denied.error.unwrap().contains("read-only"));
+    assert_eq!(
+        external
+            .query_one("SELECT count(*) FROM fixture.products", &[])
+            .await
+            .unwrap()
+            .get::<_, i64>(0),
+        3
+    );
+    db.disconnect(&readonly.id).await.unwrap();
+    db.disconnect(&p.id).await.unwrap();
+}
