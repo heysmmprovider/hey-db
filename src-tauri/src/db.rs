@@ -4,6 +4,7 @@ use crate::{
 };
 use futures_util::{pin_mut, TryStreamExt};
 use postgres_native_tls::MakeTlsConnector;
+use sqlparser::ast::{Statement, TransactionAccessMode, TransactionMode};
 use std::{
     collections::{HashMap, HashSet, VecDeque},
     sync::{
@@ -63,6 +64,67 @@ fn tls() -> Result<MakeTlsConnector, String> {
         .build()
         .map(MakeTlsConnector::new)
         .map_err(|_| "Could not initialize secure connections.".into())
+}
+
+async fn start_transaction<'a>(
+    client: &'a mut Client,
+    read_only: bool,
+    ast: &Statement,
+) -> Result<Transaction<'a>, String> {
+    let modes = match ast {
+        Statement::StartTransaction { modes, .. } => modes.as_slice(),
+        _ => &[],
+    };
+    if read_only
+        && modes.contains(&TransactionMode::AccessMode(
+            TransactionAccessMode::ReadWrite,
+        ))
+    {
+        return Err(
+            "This connection is in read-only mode; BEGIN READ WRITE is not allowed.".into(),
+        );
+    }
+    let tx = client
+        .build_transaction()
+        .read_only(read_only)
+        .start()
+        .await
+        .map_err(error)?;
+    if !modes.is_empty() {
+        // These modes are parser enums, not interpolated SQL text. Let PostgreSQL
+        // validate them before any statement in this transaction executes.
+        let modes = modes.iter().map(ToString::to_string).collect::<Vec<_>>();
+        if let Err(err) = tx
+            .batch_execute(&format!("SET TRANSACTION {}", modes.join(", ")))
+            .await
+        {
+            let message = error(err);
+            tx.rollback().await.map_err(error)?;
+            return Err(message);
+        }
+    }
+    Ok(tx)
+}
+
+fn statement_outcome(
+    number: usize,
+    ast: &Statement,
+    result: Option<&QueryResult>,
+    elapsed_ms: u128,
+) -> StatementOutcome {
+    StatementOutcome {
+        number,
+        command: ast
+            .to_string()
+            .split_whitespace()
+            .next()
+            .unwrap_or("SQL")
+            .to_owned(),
+        affected_rows: result.map_or(0, |r| r.affected_rows),
+        returned_rows: result.map_or(0, |r| r.rows.len()),
+        elapsed_ms,
+        committed: false,
+    }
 }
 
 impl Database {
@@ -228,68 +290,160 @@ impl Database {
             refresh_sql: None,
             error: None,
         };
-        for (index, (source, ast)) in statements.into_iter().enumerate() {
-            let number = index + 1;
-            if canceled.load(Ordering::SeqCst) {
-                script.error = Some(format!("Stopped before statement {number}: query canceled. Earlier committed statements remain committed."));
-                break;
-            }
-            match Self::execute_statement(&session, &mut client, source, &ast, &token, &canceled)
-                .await
-            {
-                Ok(result) => {
-                    script.statements.push(StatementOutcome {
-                        number,
-                        command: ast
-                            .to_string()
-                            .split_whitespace()
-                            .next()
-                            .unwrap_or("SQL")
-                            .to_owned(),
-                        affected_rows: result.affected_rows,
-                        returned_rows: result.rows.len(),
-                        elapsed_ms: result.elapsed_ms,
-                        committed: !result.truncated,
-                    });
-                    // Refresh the final query only, excluding explicit writes (including write CTEs).
-                    script.refresh_sql = edits::can_refresh(&ast).then(|| source.to_owned());
-                    let truncated = result.truncated;
-                    script.result = Some(result);
-                    if truncated {
-                        if number < script.total_statements {
-                            script.error = Some(format!("Stopped at statement {number}: result limit reached and its transaction was rolled back. Remaining statements were not run. Earlier committed statements remain committed."));
-                        }
-                        break;
-                    }
+        let mut index = 0;
+        while index < statements.len() {
+            let explicit = matches!(statements[index].1, Statement::StartTransaction { .. });
+            // parse_script has already checked that blocks are complete and not
+            // nested. Each block shares a transaction; other statements get one
+            // transaction each, preserving the existing autocommit behavior.
+            let end = if explicit {
+                (index + 1..statements.len())
+                    .find(|&i| {
+                        matches!(
+                            statements[i].1,
+                            Statement::Commit { .. } | Statement::Rollback { .. }
+                        )
+                    })
+                    .expect("validated transaction block")
+            } else {
+                index
+            };
+            let outcome_start = script.statements.len();
+            let mut number = index + 1;
+            let mut limited = false;
+            let execution = async {
+                if canceled.load(Ordering::SeqCst) {
+                    return Err("Query canceled.".into());
                 }
-                Err(error) => {
-                    script.error = Some(format!("Statement {number} of {} failed: {error} Remaining statements were not run. Earlier committed statements remain committed.", script.total_statements));
-                    // A failed statement can invalidate a preceding editable snapshot.
+                let start = Instant::now();
+                let tx =
+                    start_transaction(&mut client, session.profile.read_only, &statements[index].1)
+                        .await?;
+                if explicit {
+                    script.statements.push(statement_outcome(
+                        number,
+                        &statements[index].1,
+                        None,
+                        start.elapsed().as_millis(),
+                    ));
+                }
+                let body = if explicit {
+                    index + 1..end
+                } else {
+                    index..end + 1
+                };
+                let run = async {
+                    for i in body {
+                        number = i + 1;
+                        if canceled.load(Ordering::SeqCst) {
+                            return Err("Query canceled.".to_owned());
+                        }
+                        let (source, ast) = &statements[i];
+                        let result =
+                            Self::execute_statement(&session, &tx, source, ast, &token).await?;
+                        script.statements.push(statement_outcome(
+                            number,
+                            ast,
+                            Some(&result),
+                            result.elapsed_ms,
+                        ));
+                        // COMMIT must preserve the final data result. Refresh may
+                        // rerun that query, but never the preceding transaction.
+                        script.refresh_sql = edits::can_refresh(ast).then(|| (*source).to_owned());
+                        limited = result.truncated;
+                        script.result = Some(result);
+                        if limited {
+                            return Err("The result limit was reached.".into());
+                        }
+                    }
+                    number = end + 1;
+                    if canceled.load(Ordering::SeqCst) {
+                        return Err("Query canceled.".into());
+                    }
+                    Ok(())
+                }
+                .await;
+                if let Err(message) = run {
+                    return match tx.rollback().await {
+                        Ok(()) => Err(format!(
+                            "{message} The current transaction was rolled back."
+                        )),
+                        Err(err) => Err(format!(
+                            "{message} Could not confirm rollback: {}",
+                            error(err)
+                        )),
+                    };
+                }
+                let start = Instant::now();
+                if explicit && matches!(statements[end].1, Statement::Rollback { .. }) {
+                    tx.rollback().await.map_err(error)?;
                     script.result = None;
                     script.refresh_sql = None;
                     session.snapshots.lock().await.clear();
-                    break;
+                    script.statements.push(statement_outcome(
+                        number,
+                        &statements[end].1,
+                        None,
+                        start.elapsed().as_millis(),
+                    ));
+                } else {
+                    // A deferred constraint may fail at COMMIT. Do not report
+                    // any statement in the block as committed until it succeeds.
+                    tx.commit().await.map_err(error)?;
+                    if explicit {
+                        script.statements.push(statement_outcome(
+                            number,
+                            &statements[end].1,
+                            None,
+                            start.elapsed().as_millis(),
+                        ));
+                    }
+                    for outcome in &mut script.statements[outcome_start..] {
+                        outcome.committed = true;
+                    }
                 }
+                Ok::<_, String>(())
             }
+            .await;
+            if let Err(message) = execution {
+                session.snapshots.lock().await.clear();
+                if limited {
+                    // These rows can describe writes that have just rolled back.
+                    // Keep the truncated display, but never allow edits from it.
+                    if let Some(result) = &mut script.result {
+                        for column in &mut result.columns {
+                            column.editable = false;
+                        }
+                        result.read_only_reason =
+                            Some("Results from a rolled-back transaction are read-only.".into());
+                    }
+                } else {
+                    script.result = None;
+                }
+                if explicit || !limited {
+                    script.refresh_sql = None;
+                }
+                // A standalone truncated SELECT historically returns its partial
+                // grid without an error. A transaction block must explain that
+                // earlier writes in the block have also been rolled back.
+                if explicit || !limited || number < script.total_statements {
+                    script.error = Some(format!("Statement {number} of {} failed: {message} Remaining statements were not run. Earlier committed transactions remain committed.", script.total_statements));
+                }
+                break;
+            }
+            index = end + 1;
         }
         Ok(script)
     }
     async fn execute_statement(
         session: &Session,
-        client: &mut Client,
+        tx: &Transaction<'_>,
         sql: &str,
         ast: &sqlparser::ast::Statement,
         token: &CancelToken,
-        canceled: &AtomicBool,
     ) -> Result<QueryResult, String> {
         let is_select = matches!(ast, sqlparser::ast::Statement::Query(_));
         let start = Instant::now();
-        let tx = client
-            .build_transaction()
-            .read_only(session.profile.read_only)
-            .start()
-            .await
-            .map_err(error)?;
         let prepared = tx.prepare(sql).await.map_err(error)?;
         let mut columns: Vec<_> = prepared
             .columns()
@@ -306,7 +460,7 @@ impl Database {
         } else if !edits::is_plain_select(ast) {
             (None,Some("Only direct columns from a single table can be edited. Joins, expressions, aggregates and CTEs are read-only.".into()))
         } else {
-            match target_for(&tx, prepared.columns()).await {
+            match target_for(tx, prepared.columns()).await {
                 Ok(target) => (Some(target), None),
                 Err(why) => (None, Some(why)),
             }
@@ -346,17 +500,8 @@ impl Database {
                 }
             }
         }
-        if truncated {
-            tx.rollback().await.map_err(error)?;
-            if !is_select {
-                return Err("The result exceeded the display limit. The statement was rolled back; no changes were committed.".into());
-            }
-        } else {
-            if canceled.load(Ordering::SeqCst) {
-                tx.rollback().await.map_err(error)?;
-                return Err("Query canceled. The statement was rolled back.".into());
-            }
-            tx.commit().await.map_err(error)?;
+        if truncated && !is_select {
+            return Err("The result exceeded the display limit.".into());
         }
         if let Some(ref candidate) = target {
             let keys: Vec<_> = candidate

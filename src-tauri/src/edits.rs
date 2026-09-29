@@ -86,10 +86,57 @@ pub fn parse_script(sql: &str) -> Result<Vec<(&str, Statement)>, String> {
     if statements.is_empty() {
         return Err("Enter at least one SQL statement to run.".into());
     }
+    // A run owns its transactions: never leave one open for another tab, schema
+    // refresh, or cell edit to accidentally commit. Validate before any writes.
+    let mut transaction_start = None;
+    for (index, (_, ast)) in statements.iter().enumerate() {
+        let number = index + 1;
+        match ast {
+            Statement::StartTransaction { .. } => {
+                if transaction_start.is_some() {
+                    return Err(format!("Statement {number}: nested transactions are not supported. No statements were executed."));
+                }
+                transaction_start = Some(number);
+            }
+            Statement::Commit { .. } | Statement::Rollback { .. } => {
+                transaction_start.take().ok_or_else(|| format!("Statement {number}: COMMIT or ROLLBACK requires a preceding BEGIN in the same run. No statements were executed."))?;
+            }
+            _ => {}
+        }
+    }
+    if let Some(number) = transaction_start {
+        return Err(format!("Transaction started at statement {number} has no COMMIT or ROLLBACK. Include the complete transaction in one run. No statements were executed."));
+    }
     Ok(statements)
 }
 
 fn validate_statement(stmt: &Statement) -> Result<(), String> {
+    match stmt {
+        Statement::StartTransaction {
+            modifier: None,
+            statements,
+            exception: None,
+            has_end_keyword: false,
+            ..
+        } if statements.is_empty() => return Ok(()),
+        Statement::Commit {
+            chain: false,
+            modifier: None,
+            ..
+        }
+        | Statement::Rollback {
+            chain: false,
+            savepoint: None,
+        } => return Ok(()),
+        Statement::StartTransaction { .. }
+        | Statement::Commit { .. }
+        | Statement::Rollback { .. }
+        | Statement::Savepoint { .. }
+        | Statement::ReleaseSavepoint { .. } => {
+            return Err("Use a complete BEGIN … COMMIT or BEGIN … ROLLBACK block in one run. Savepoints, transaction chaining, and procedural blocks are not supported yet.".into());
+        }
+        _ => {}
+    }
     let text = stmt.to_string();
     let first = text.split_whitespace().next().unwrap_or("").to_uppercase();
     if [
@@ -113,7 +160,7 @@ fn validate_statement(stmt: &Statement) -> Result<(), String> {
     ]
     .contains(&first.as_str())
     {
-        return Err("Each statement runs in its own transaction. Session commands, COPY, and explicit transaction control are not supported yet.".into());
+        return Err("Session commands, COPY, and procedures are not supported yet. Transactions must use a complete BEGIN … COMMIT or BEGIN … ROLLBACK block in one run.".into());
     }
     Ok(())
 }
@@ -352,6 +399,40 @@ mod tests {
             "SELECT 1 END",
         ] {
             assert!(super::parse_script(sql).is_err(), "{sql}");
+        }
+    }
+
+    #[test]
+    fn accepts_complete_transactions_and_preserves_function_bodies() {
+        for sql in [
+            "BEGIN; SELECT 1; COMMIT;",
+            "START TRANSACTION ISOLATION LEVEL SERIALIZABLE READ ONLY; SELECT 1; COMMIT AND NO CHAIN;",
+            "BEGIN WORK; SELECT 1; ROLLBACK WORK; SELECT 2; BEGIN; COMMIT;",
+            "BEGIN; CREATE FUNCTION demo() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN NEW.name := 'x;y'; RETURN NEW; END $$; COMMIT;",
+        ] {
+            assert!(parse_script(sql).is_ok(), "{sql}");
+        }
+    }
+
+    #[test]
+    fn rejects_incomplete_and_unsupported_transactions_before_execution() {
+        for sql in [
+            "SELECT 1; BEGIN; SELECT 2;",
+            "SELECT 1; COMMIT;",
+            "ROLLBACK;",
+            "BEGIN; BEGIN; COMMIT; COMMIT;",
+            "BEGIN; COMMIT AND CHAIN; ROLLBACK;",
+            "BEGIN; ROLLBACK AND CHAIN; COMMIT;",
+            "BEGIN; SAVEPOINT s; COMMIT;",
+            "BEGIN; ROLLBACK TO SAVEPOINT s; COMMIT;",
+            "BEGIN; RELEASE SAVEPOINT s; COMMIT;",
+            "BEGIN; SET TRANSACTION READ WRITE; COMMIT;",
+        ] {
+            let error = parse_script(sql).unwrap_err();
+            assert!(
+                error.contains("No statements were executed"),
+                "{sql}: {error}"
+            );
         }
     }
 
