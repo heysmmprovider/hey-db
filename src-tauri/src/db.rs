@@ -1,5 +1,5 @@
 use crate::{
-    edits::{self, TextParameter},
+    edits::{self, ParsedStatement, TextParameter},
     model::*,
 };
 use futures_util::{pin_mut, TryStreamExt};
@@ -69,10 +69,10 @@ fn tls() -> Result<MakeTlsConnector, String> {
 async fn start_transaction<'a>(
     client: &'a mut Client,
     read_only: bool,
-    ast: &Statement,
+    ast: &ParsedStatement,
 ) -> Result<Transaction<'a>, String> {
-    let modes = match ast {
-        Statement::StartTransaction { modes, .. } => modes.as_slice(),
+    let modes = match ast.ast() {
+        Some(Statement::StartTransaction { modes, .. }) => modes.as_slice(),
         _ => &[],
     };
     if read_only
@@ -108,18 +108,13 @@ async fn start_transaction<'a>(
 
 fn statement_outcome(
     number: usize,
-    ast: &Statement,
+    ast: &ParsedStatement,
     result: Option<&QueryResult>,
     elapsed_ms: u128,
 ) -> StatementOutcome {
     StatementOutcome {
         number,
-        command: ast
-            .to_string()
-            .split_whitespace()
-            .next()
-            .unwrap_or("SQL")
-            .to_owned(),
+        command: ast.command(),
         affected_rows: result.map_or(0, |r| r.affected_rows),
         returned_rows: result.map_or(0, |r| r.rows.len()),
         elapsed_ms,
@@ -292,7 +287,10 @@ impl Database {
         };
         let mut index = 0;
         while index < statements.len() {
-            let explicit = matches!(statements[index].1, Statement::StartTransaction { .. });
+            let explicit = matches!(
+                statements[index].1.ast(),
+                Some(Statement::StartTransaction { .. })
+            );
             // parse_script has already checked that blocks are complete and not
             // nested. Each block shares a transaction; other statements get one
             // transaction each, preserving the existing autocommit behavior.
@@ -300,8 +298,8 @@ impl Database {
                 (index + 1..statements.len())
                     .find(|&i| {
                         matches!(
-                            statements[i].1,
-                            Statement::Commit { .. } | Statement::Rollback { .. }
+                            statements[i].1.ast(),
+                            Some(Statement::Commit { .. } | Statement::Rollback { .. })
                         )
                     })
                     .expect("validated transaction block")
@@ -375,7 +373,7 @@ impl Database {
                     };
                 }
                 let start = Instant::now();
-                if explicit && matches!(statements[end].1, Statement::Rollback { .. }) {
+                if explicit && matches!(statements[end].1.ast(), Some(Statement::Rollback { .. })) {
                     tx.rollback().await.map_err(error)?;
                     script.result = None;
                     script.refresh_sql = None;
@@ -439,10 +437,10 @@ impl Database {
         session: &Session,
         tx: &Transaction<'_>,
         sql: &str,
-        ast: &sqlparser::ast::Statement,
+        ast: &ParsedStatement,
         token: &CancelToken,
     ) -> Result<QueryResult, String> {
-        let is_select = matches!(ast, sqlparser::ast::Statement::Query(_));
+        let is_select = matches!(ast.ast(), Some(Statement::Query(_)));
         let start = Instant::now();
         let prepared = tx.prepare(sql).await.map_err(error)?;
         let mut columns: Vec<_> = prepared

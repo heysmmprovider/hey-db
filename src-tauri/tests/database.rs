@@ -821,3 +821,254 @@ async fn explicit_transactions_roll_back_on_cancel_limits_and_read_only_errors()
     db.disconnect(&readonly.id).await.unwrap();
     db.disconnect(&p.id).await.unwrap();
 }
+
+#[tokio::test]
+#[ignore = "requires isolated PostgreSQL; use npm run test:database"]
+async fn do_blocks_execute_once_and_preserve_quoted_bodies() {
+    let (db, p, external) = setup().await;
+    let standalone = db
+        .script(
+            &p.id,
+            r#"
+        DO $migration$
+        DECLARE label text := $value$it's; quoted →$value$;
+        BEGIN
+            INSERT INTO fixture.keyless(name) VALUES (label);
+            EXECUTE $sql$INSERT INTO fixture.keyless(name) VALUES ('dynamic; SQL')$sql$;
+        END $migration$;
+    "#,
+            "do-standalone",
+        )
+        .await
+        .unwrap();
+    assert!(standalone.error.is_none(), "{:?}", standalone.error);
+    assert_eq!(standalone.statements.len(), 1);
+    assert_eq!(standalone.statements[0].command, "DO");
+    assert!(standalone.statements[0].committed);
+    assert!(standalone.result.unwrap().columns.is_empty());
+    assert!(standalone.refresh_sql.is_none());
+    let names: Vec<String> = external
+        .query("SELECT name FROM fixture.keyless ORDER BY name", &[])
+        .await
+        .unwrap()
+        .iter()
+        .map(|r| r.get(0))
+        .collect();
+    assert_eq!(names, ["dynamic; SQL", "it's; quoted →", "sample"]);
+
+    for sql in [
+        "DO LANGUAGE plpgsql $$ BEGIN INSERT INTO fixture.keyless VALUES ('language first'); END $$;",
+        "DO $$ BEGIN INSERT INTO fixture.keyless VALUES ('language last'); END $$ LANGUAGE plpgsql;",
+        "DO 'BEGIN INSERT INTO fixture.keyless VALUES (''single; quote''); END' LANGUAGE 'plpgsql';",
+        r#"DO LANGUAGE "plpgsql" E'BEGIN\nPERFORM 1;\nEND';"#,
+    ] {
+        let result = db.query(&p.id, sql, "do-forms").await.unwrap();
+        assert!(result.columns.is_empty());
+    }
+
+    let result = db.script(&p.id,
+        "BEGIN; DO $$ BEGIN UPDATE fixture.products SET stock=stock+1 WHERE id=1001; END $$; SELECT id,name,stock FROM fixture.products ORDER BY id; COMMIT;",
+        "do-refresh").await.unwrap();
+    assert!(result.error.is_none(), "{:?}", result.error);
+    assert!(result.statements.iter().all(|s| s.committed));
+    assert_eq!(result.statements[1].command, "DO");
+    assert!(result.result.unwrap().columns[1].editable);
+    let refreshed = db
+        .query(
+            &p.id,
+            result.refresh_sql.as_deref().unwrap(),
+            "refresh-after-do",
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        refreshed.rows[0][2].as_deref(),
+        Some("43"),
+        "refresh must not replay DO"
+    );
+    db.disconnect(&p.id).await.unwrap();
+}
+
+#[tokio::test]
+#[ignore = "requires isolated PostgreSQL; use npm run test:database"]
+async fn do_migration_guards_fail_or_commit_with_the_surrounding_transaction() {
+    let (db, p, external) = setup().await;
+    external.batch_execute("CREATE TABLE fixture.schema_migrations (version integer PRIMARY KEY); INSERT INTO fixture.schema_migrations VALUES (1);").await.unwrap();
+    let migration = r#"
+        BEGIN;
+        UPDATE fixture.products SET stock=stock+1 WHERE id=1001;
+        DO $$ BEGIN
+            IF NOT EXISTS (SELECT 1 FROM fixture.schema_migrations WHERE version=2) THEN
+                RAISE EXCEPTION 'Import migrations 001 and 002 first';
+            END IF;
+        END $$;
+        CREATE TABLE fixture.admins (id integer PRIMARY KEY);
+        INSERT INTO fixture.schema_migrations VALUES (3);
+        COMMIT;
+    "#;
+    let failed = db.script(&p.id, migration, "guard-failed").await.unwrap();
+    let message = failed.error.unwrap();
+    assert!(message.contains("Statement 3 of 6 failed"), "{message}");
+    assert!(
+        message.contains("Import migrations 001 and 002 first"),
+        "{message}"
+    );
+    assert!(failed.statements.iter().all(|s| !s.committed));
+    assert!(failed.result.is_none());
+    assert!(failed.refresh_sql.is_none());
+    assert_eq!(
+        external
+            .query_one("SELECT stock FROM fixture.products WHERE id=1001", &[])
+            .await
+            .unwrap()
+            .get::<_, i32>(0),
+        42
+    );
+    assert!(external
+        .query_one("SELECT to_regclass('fixture.admins')::text", &[])
+        .await
+        .unwrap()
+        .get::<_, Option<String>>(0)
+        .is_none());
+
+    external
+        .execute("INSERT INTO fixture.schema_migrations VALUES (2)", &[])
+        .await
+        .unwrap();
+    let passed = db.script(&p.id, migration, "guard-passed").await.unwrap();
+    assert!(passed.error.is_none(), "{:?}", passed.error);
+    assert_eq!(passed.statements.len(), 6);
+    assert!(passed.statements.iter().all(|s| s.committed));
+    assert_eq!(
+        external
+            .query_one("SELECT count(*) FROM fixture.schema_migrations", &[])
+            .await
+            .unwrap()
+            .get::<_, i64>(0),
+        3
+    );
+    assert_eq!(
+        external
+            .query_one("SELECT stock FROM fixture.products WHERE id=1001", &[])
+            .await
+            .unwrap()
+            .get::<_, i32>(0),
+        43
+    );
+
+    // Invalid procedural code is diagnosed by PostgreSQL and rolls back prior
+    // writes in the block. Malformed outer SQL is rejected before any writes.
+    let syntax = db.script(&p.id,
+        "BEGIN; UPDATE fixture.products SET stock=0; DO $$ BEGIN not valid plpgsql; END $$; COMMIT;",
+        "body-syntax").await.unwrap();
+    assert!(syntax.error.unwrap().contains("PostgreSQL"));
+    assert!(syntax.statements.iter().all(|s| !s.committed));
+    assert!(db
+        .script(
+            &p.id,
+            "DELETE FROM fixture.products; DO BEGIN NULL; END;",
+            "bad-wrapper"
+        )
+        .await
+        .is_err());
+    assert_eq!(
+        external
+            .query_one("SELECT stock FROM fixture.products WHERE id=1001", &[])
+            .await
+            .unwrap()
+            .get::<_, i32>(0),
+        43
+    );
+    assert_eq!(
+        external
+            .query_one("SELECT count(*) FROM fixture.products", &[])
+            .await
+            .unwrap()
+            .get::<_, i64>(0),
+        3
+    );
+    db.disconnect(&p.id).await.unwrap();
+}
+
+#[tokio::test]
+#[ignore = "requires isolated PostgreSQL; use npm run test:database"]
+async fn do_blocks_honor_cancellation_read_only_and_transaction_boundaries() {
+    let (db, p, external) = setup().await;
+    let (canceled, cancel_result) = tokio::join!(
+        db.script(&p.id, "BEGIN; UPDATE fixture.products SET stock=0; DO $$ BEGIN INSERT INTO fixture.keyless VALUES ('canceled'); PERFORM pg_sleep(15); END $$; COMMIT; DELETE FROM fixture.products;", "cancel-do"),
+        async { tokio::time::sleep(std::time::Duration::from_millis(300)).await; db.cancel(&p.id, "cancel-do").await }
+    );
+    cancel_result.unwrap();
+    let canceled = canceled.unwrap();
+    assert!(canceled.error.unwrap().contains("canceled"));
+    assert!(canceled.statements.iter().all(|s| !s.committed));
+    assert!(canceled.result.is_none());
+    assert!(db
+        .query(&p.id, "SELECT 1", "after-canceled-do")
+        .await
+        .is_ok());
+
+    for sql in [
+        "DO $$ BEGIN UPDATE fixture.products SET stock=0; COMMIT; END $$;",
+        "BEGIN; UPDATE fixture.products SET stock=0; DO $$ BEGIN ROLLBACK; END $$; COMMIT;",
+    ] {
+        let result = db.script(&p.id, sql, "inner-transaction").await.unwrap();
+        assert!(result.error.unwrap().contains("transaction termination"));
+        assert!(result.statements.iter().all(|s| !s.committed));
+    }
+    let mut readonly = p.clone();
+    readonly.id = uuid::Uuid::new_v4().to_string();
+    readonly.read_only = true;
+    db.connect(
+        readonly.clone(),
+        std::env::var("HEY_DB_TEST_PASSWORD").unwrap(),
+    )
+    .await
+    .unwrap();
+    assert!(db
+        .query(
+            &readonly.id,
+            "DO $$ BEGIN PERFORM count(*) FROM fixture.products; END $$",
+            "readonly-do"
+        )
+        .await
+        .is_ok());
+    for sql in [
+        "DO $$ BEGIN DELETE FROM fixture.products; END $$;",
+        "BEGIN; DO $$ BEGIN EXECUTE 'DELETE FROM fixture.products'; END $$; COMMIT;",
+        "DO $$ BEGIN EXECUTE 'SET TRANSACTION READ WRITE'; DELETE FROM fixture.products; END $$;",
+    ] {
+        let denied = db
+            .script(&readonly.id, sql, "readonly-do-write")
+            .await
+            .unwrap();
+        assert!(denied.error.is_some(), "read-only connection allowed {sql}");
+        assert!(denied.statements.iter().all(|s| !s.committed));
+    }
+    assert_eq!(
+        external
+            .query_one("SELECT count(*) FROM fixture.products", &[])
+            .await
+            .unwrap()
+            .get::<_, i64>(0),
+        3
+    );
+    assert_eq!(
+        external
+            .query_one("SELECT stock FROM fixture.products WHERE id=1001", &[])
+            .await
+            .unwrap()
+            .get::<_, i32>(0),
+        42
+    );
+    assert_eq!(
+        external
+            .query_one("SELECT count(*) FROM fixture.keyless", &[])
+            .await
+            .unwrap()
+            .get::<_, i64>(0),
+        1
+    );
+    db.disconnect(&readonly.id).await.unwrap();
+    db.disconnect(&p.id).await.unwrap();
+}

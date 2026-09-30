@@ -3,11 +3,72 @@ use bytes::BytesMut;
 use sqlparser::{
     ast::{Expr, GroupByExpr, Query, SelectItem, SetExpr, Statement, TableFactor},
     dialect::PostgreSqlDialect,
-    parser::Parser,
+    keywords::Keyword,
+    parser::{Parser, ParserError},
     tokenizer::Token,
 };
 use std::collections::{BTreeMap, HashSet};
 use tokio_postgres::types::{Format, IsNull, ToSql, Type};
+
+#[derive(Debug)]
+pub enum ParsedStatement {
+    Sql(Box<Statement>),
+    // sqlparser does not support PostgreSQL DO. Its quoted body is opaque here;
+    // PostgreSQL parses the procedural language when the original SQL executes.
+    DoBlock,
+}
+
+impl ParsedStatement {
+    pub fn ast(&self) -> Option<&Statement> {
+        match self {
+            Self::Sql(ast) => Some(ast),
+            Self::DoBlock => None,
+        }
+    }
+
+    pub fn command(&self) -> String {
+        match self {
+            Self::DoBlock => "DO".into(),
+            Self::Sql(ast) => ast
+                .to_string()
+                .split_whitespace()
+                .next()
+                .unwrap_or("SQL")
+                .to_owned(),
+        }
+    }
+}
+
+fn parse_do_block(parser: &mut Parser<'_>) -> Result<ParsedStatement, ParserError> {
+    fn language(parser: &mut Parser<'_>) -> Result<(), ParserError> {
+        let name = parser.next_token();
+        match name.token {
+            Token::Word(_)
+            | Token::SingleQuotedString(_)
+            | Token::DollarQuotedString(_)
+            | Token::EscapedStringLiteral(_)
+            | Token::UnicodeStringLiteral(_) => Ok(()),
+            _ => parser.expected("a language name", name),
+        }
+    }
+
+    let language_first = parser.parse_keyword(Keyword::LANGUAGE);
+    if language_first {
+        language(parser)?;
+    }
+    let body = parser.next_token();
+    match body.token {
+        Token::DollarQuotedString(_)
+        | Token::SingleQuotedString(_)
+        | Token::EscapedStringLiteral(_)
+        | Token::UnicodeStringLiteral(_) => {}
+        _ => return parser.expected("a quoted DO body", body),
+    }
+    if !language_first && parser.parse_keyword(Keyword::LANGUAGE) {
+        language(parser)?;
+    }
+    Ok(ParsedStatement::DoBlock)
+}
 
 pub fn quote_ident(value: &str) -> String {
     format!("\"{}\"", value.replace('"', "\"\""))
@@ -20,7 +81,7 @@ pub fn qualified(target: &Target) -> String {
     )
 }
 
-pub fn parse_statement(sql: &str) -> Result<Statement, String> {
+pub fn parse_statement(sql: &str) -> Result<ParsedStatement, String> {
     let mut statements = parse_script(sql)?;
     if statements.len() != 1 {
         return Err(
@@ -32,7 +93,7 @@ pub fn parse_statement(sql: &str) -> Result<Statement, String> {
 
 // Use the parser's statement boundaries, then slice the original SQL. Reprinting
 // an AST can change PostgreSQL literals; splitting on ';' breaks quoted bodies.
-pub fn parse_script(sql: &str) -> Result<Vec<(&str, Statement)>, String> {
+pub fn parse_script(sql: &str) -> Result<Vec<(&str, ParsedStatement)>, String> {
     if sql.len() > 1024 * 1024 {
         return Err("SQL is limited to 1 MiB per run.".into());
     }
@@ -66,11 +127,20 @@ pub fn parse_script(sql: &str) -> Result<Vec<(&str, Statement)>, String> {
         }
         let start = offset(first.span.start);
         let number = statements.len() + 1;
-        let ast = parser.parse_statement().map_err(|e| {
+        let parsed = if parser.parse_keyword(Keyword::DO) {
+            parse_do_block(&mut parser)
+        } else {
+            parser
+                .parse_statement()
+                .map(|ast| ParsedStatement::Sql(Box::new(ast)))
+        };
+        let ast = parsed.map_err(|e| {
             format!("Statement {number} could not be parsed: {e}. No statements were executed.")
         })?;
-        validate_statement(&ast)
-            .map_err(|e| format!("Statement {number}: {e} No statements were executed."))?;
+        if let Some(ast) = ast.ast() {
+            validate_statement(ast)
+                .map_err(|e| format!("Statement {number}: {e} No statements were executed."))?;
+        }
         let next = parser.peek_token();
         let end = match next.token {
             Token::EOF => sql.len(),
@@ -91,14 +161,14 @@ pub fn parse_script(sql: &str) -> Result<Vec<(&str, Statement)>, String> {
     let mut transaction_start = None;
     for (index, (_, ast)) in statements.iter().enumerate() {
         let number = index + 1;
-        match ast {
-            Statement::StartTransaction { .. } => {
+        match ast.ast() {
+            Some(Statement::StartTransaction { .. }) => {
                 if transaction_start.is_some() {
                     return Err(format!("Statement {number}: nested transactions are not supported. No statements were executed."));
                 }
                 transaction_start = Some(number);
             }
-            Statement::Commit { .. } | Statement::Rollback { .. } => {
+            Some(Statement::Commit { .. } | Statement::Rollback { .. }) => {
                 transaction_start.take().ok_or_else(|| format!("Statement {number}: COMMIT or ROLLBACK requires a preceding BEGIN in the same run. No statements were executed."))?;
             }
             _ => {}
@@ -133,7 +203,7 @@ fn validate_statement(stmt: &Statement) -> Result<(), String> {
         | Statement::Rollback { .. }
         | Statement::Savepoint { .. }
         | Statement::ReleaseSavepoint { .. } => {
-            return Err("Use a complete BEGIN … COMMIT or BEGIN … ROLLBACK block in one run. Savepoints, transaction chaining, and procedural blocks are not supported yet.".into());
+            return Err("Use a complete BEGIN … COMMIT or BEGIN … ROLLBACK block in one run. Savepoints, transaction chaining, and unquoted procedural blocks are not supported yet.".into());
         }
         _ => {}
     }
@@ -156,16 +226,15 @@ fn validate_statement(stmt: &Statement) -> Result<(), String> {
         "DEALLOCATE",
         "COPY",
         "CALL",
-        "DO",
     ]
     .contains(&first.as_str())
     {
-        return Err("Session commands, COPY, and procedures are not supported yet. Transactions must use a complete BEGIN … COMMIT or BEGIN … ROLLBACK block in one run.".into());
+        return Err("Session commands, COPY, and CALL are not supported yet. Transactions must use a complete BEGIN … COMMIT or BEGIN … ROLLBACK block in one run.".into());
     }
     Ok(())
 }
 
-pub fn can_refresh(stmt: &Statement) -> bool {
+pub fn can_refresh(stmt: &ParsedStatement) -> bool {
     fn query(value: &Query) -> bool {
         value
             .with
@@ -182,11 +251,11 @@ pub fn can_refresh(stmt: &Statement) -> bool {
             _ => false,
         }
     }
-    matches!(stmt, Statement::Query(value) if query(value))
+    matches!(stmt.ast(), Some(Statement::Query(value)) if query(value))
 }
 
-pub fn is_plain_select(stmt: &Statement) -> bool {
-    let Statement::Query(query) = stmt else {
+pub fn is_plain_select(stmt: &ParsedStatement) -> bool {
+    let Some(Statement::Query(query)) = stmt.ast() else {
         return false;
     };
     if query.with.is_some() {
@@ -411,6 +480,60 @@ mod tests {
             "BEGIN; CREATE FUNCTION demo() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN NEW.name := 'x;y'; RETURN NEW; END $$; COMMIT;",
         ] {
             assert!(parse_script(sql).is_ok(), "{sql}");
+        }
+    }
+
+    #[test]
+    fn accepts_postgresql_do_blocks_without_refresh_or_cell_edits() {
+        for sql in [
+            "DO $$ BEGIN PERFORM 1; END $$",
+            "do $migration$ BEGIN RAISE NOTICE 'begin; commit; →'; END $migration$;",
+            "DO LANGUAGE plpgsql $$ BEGIN NULL; END $$;",
+            "DO $$ BEGIN NULL; END $$ LANGUAGE plpgsql;",
+            "DO LANGUAGE \"plpgsql\" 'BEGIN RAISE NOTICE ''it''''s fine;''; END';",
+            "DO 'BEGIN NULL; END' LANGUAGE 'plpgsql';",
+            r"DO E'BEGIN\nPERFORM 1;\nEND';",
+            "DO U&'BEGIN NULL; END';",
+        ] {
+            let stmt = parse_statement(sql).unwrap_or_else(|e| panic!("{sql}: {e}"));
+            assert!(matches!(stmt, ParsedStatement::DoBlock));
+            assert_eq!(stmt.command(), "DO");
+            assert!(!can_refresh(&stmt));
+            assert!(!is_plain_select(&stmt));
+        }
+    }
+
+    #[test]
+    fn preserves_do_bodies_and_surrounding_statement_boundaries() {
+        let body = "DO /* header; */ $guard$\r\nBEGIN\r\n  IF NOT EXISTS (SELECT 1 FROM migrations WHERE version=2) THEN\r\n    RAISE EXCEPTION 'Import migrations first; →';\r\n  END IF;\r\n  EXECUTE $sql$SELECT 'nested; quote'$sql$;\r\n  -- BEGIN; COMMIT; inside the body\r\nEND $guard$ LANGUAGE plpgsql";
+        let sql = format!("-- migration;\r\nBEGIN;\r\n{body};\r\nSELECT 2;\r\nCOMMIT;");
+        let statements = parse_script(&sql).unwrap();
+        assert_eq!(statements.len(), 4);
+        assert_eq!(statements[1].0, body);
+        assert!(matches!(statements[1].1, ParsedStatement::DoBlock));
+        assert_eq!(statements[2].0, "SELECT 2");
+        assert_eq!(statements[3].0, "COMMIT");
+    }
+
+    #[test]
+    fn rejects_malformed_do_wrappers_and_unsupported_following_commands() {
+        for sql in [
+            "DO",
+            "DO BEGIN NULL; END;",
+            "DO 1;",
+            "DO LANGUAGE plpgsql;",
+            "DO LANGUAGE 1 $$BEGIN NULL; END$$;",
+            "DO $$BEGIN NULL; END$$ LANGUAGE;",
+            "DO LANGUAGE plpgsql $$BEGIN NULL; END$$ LANGUAGE plpgsql;",
+            "DO $$BEGIN NULL; END$$ SELECT 1;",
+            "DO $$BEGIN NULL; END$$; SET default_transaction_read_only = off;",
+            "DO $$BEGIN NULL; END$$; CALL some_procedure();",
+            "DO $$BEGIN NULL; END$$; COMMIT;",
+            "BEGIN; DO $$BEGIN NULL; END$$;",
+            "DO $tag$BEGIN NULL; END$wrong$;",
+            "DO 'unterminated",
+        ] {
+            assert!(parse_script(sql).is_err(), "{sql}");
         }
     }
 
