@@ -37,10 +37,16 @@ The ready-to-install preview lives in [`downloads/`](../downloads/README.md), al
 On an Apple Silicon Mac with native Node.js 22.12+, Rust installed through rustup, and Xcode Command Line Tools, run:
 
 ```sh
-npm run release -- 0.1.2
+npm run release -- 0.1.6
 ```
 
 Use the version you want to release. `npm run release` without a version increments the patch number automatically; specifying the current version rebuilds it. Older versions and prerelease suffixes are rejected. Run `npm run release -- --help` for usage.
+
+If the release stops at `npm ci` with an `EALLOWSCRIPTS` error, a user-level `allow-scripts` setting in `~/.npmrc` is being forwarded by `npm run` to the nested install, which newer npm versions reject for project installs. Start the script directly instead, which skips that forwarding:
+
+```sh
+node scripts/release.mjs 0.1.6
+```
 
 The script installs dependencies with `npm ci`, synchronizes the versions in npm, Tauri, Cargo, and both lockfiles, and runs the frontend, Rust, and temporary PostgreSQL tests plus formatting and Clippy checks. The UI reads its displayed version from `package.json`. It builds the Apple Silicon `.app` and `.dmg`, verifies the app version, architecture, signature, and disk image, then replaces these files:
 
