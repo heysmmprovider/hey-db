@@ -1072,3 +1072,212 @@ async fn do_blocks_honor_cancellation_read_only_and_transaction_boundaries() {
     db.disconnect(&readonly.id).await.unwrap();
     db.disconnect(&p.id).await.unwrap();
 }
+
+#[tokio::test]
+#[ignore = "requires isolated PostgreSQL; use npm run test:database"]
+async fn set_local_applies_inside_the_block_and_reverts_afterwards() {
+    let (db, p, external) = setup().await;
+    let inside = db.script(&p.id,
+        "BEGIN; SET LOCAL lock_timeout = '3s'; SET LOCAL search_path TO fixture; SELECT current_setting('lock_timeout') AS lock_timeout, count(*) AS products FROM products; COMMIT;",
+        "set-local").await.unwrap();
+    assert!(inside.error.is_none(), "{:?}", inside.error);
+    assert_eq!(inside.statements.len(), 5);
+    assert_eq!(inside.statements[1].command, "SET");
+    assert!(inside.statements.iter().all(|s| s.committed));
+    assert_eq!(
+        inside.result.unwrap().rows[0],
+        [Some("3s".into()), Some("3".into())]
+    );
+
+    let after = db
+        .query(
+            &p.id,
+            "SELECT current_setting('lock_timeout'), current_setting('search_path')",
+            "after-set-local",
+        )
+        .await
+        .unwrap();
+    assert_eq!(after.rows[0][0].as_deref(), Some("5s"));
+    assert_ne!(after.rows[0][1].as_deref(), Some("fixture"));
+
+    let rolled_back = db.script(&p.id,
+        "BEGIN; SET LOCAL lock_timeout = '2s'; SELECT current_setting('lock_timeout'); ROLLBACK; SELECT current_setting('lock_timeout');",
+        "set-local-rollback").await.unwrap();
+    assert!(rolled_back.error.is_none(), "{:?}", rolled_back.error);
+    assert_eq!(
+        rolled_back.result.unwrap().rows[0][0].as_deref(),
+        Some("5s")
+    );
+
+    // A shorter lock timeout really applies to the statements that follow it.
+    external
+        .batch_execute("BEGIN; LOCK TABLE fixture.products IN ACCESS EXCLUSIVE MODE;")
+        .await
+        .unwrap();
+    let started = std::time::Instant::now();
+    let blocked = db.script(&p.id,
+        "BEGIN; SET LOCAL lock_timeout = '300ms'; ALTER TABLE fixture.products ADD COLUMN not_before timestamptz; COMMIT;",
+        "set-local-lock").await.unwrap();
+    let elapsed = started.elapsed();
+    external.batch_execute("ROLLBACK").await.unwrap();
+    let error = blocked.error.unwrap();
+    assert!(
+        error.contains("lock timeout") && error.contains("rolled back"),
+        "{error}"
+    );
+    assert!(elapsed < std::time::Duration::from_secs(4), "{elapsed:?}");
+    assert!(blocked.statements.iter().all(|s| !s.committed));
+    assert_eq!(
+        external
+            .query_one(
+                "SELECT count(*) FROM information_schema.columns WHERE table_schema='fixture' AND table_name='products' AND column_name='not_before'",
+                &[]
+            )
+            .await
+            .unwrap()
+            .get::<_, i64>(0),
+        0
+    );
+
+    // Transaction characteristics cannot change through SET LOCAL, so a
+    // read-only connection stays read-only while other settings still work.
+    let mut readonly = p.clone();
+    readonly.id = uuid::Uuid::new_v4().to_string();
+    readonly.read_only = true;
+    db.connect(
+        readonly.clone(),
+        std::env::var("HEY_DB_TEST_PASSWORD").unwrap(),
+    )
+    .await
+    .unwrap();
+    let denied = db
+        .script(
+            &readonly.id,
+            "BEGIN; SET LOCAL transaction_read_only = false; DELETE FROM fixture.products; COMMIT;",
+            "readonly-set-local",
+        )
+        .await
+        .unwrap_err();
+    assert!(denied.contains("No statements were executed"), "{denied}");
+    let allowed = db
+        .script(
+            &readonly.id,
+            "BEGIN; SET LOCAL lock_timeout = '1s'; SELECT count(*) FROM fixture.products; COMMIT;",
+            "readonly-set-local-ok",
+        )
+        .await
+        .unwrap();
+    assert!(allowed.error.is_none(), "{:?}", allowed.error);
+    assert_eq!(
+        external
+            .query_one("SELECT count(*) FROM fixture.products", &[])
+            .await
+            .unwrap()
+            .get::<_, i64>(0),
+        3
+    );
+    db.disconnect(&readonly.id).await.unwrap();
+    db.disconnect(&p.id).await.unwrap();
+}
+
+#[tokio::test]
+#[ignore = "requires isolated PostgreSQL; use npm run test:database"]
+async fn server_notices_and_warnings_attach_to_their_statements() {
+    let (db, p, external) = setup().await;
+    // A deferred constraint trigger raises while committing, so its message
+    // belongs to COMMIT rather than to the INSERT that queued it.
+    external.batch_execute("CREATE FUNCTION fixture.announce() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE NOTICE 'deferred trigger for %', NEW.name; RETURN NULL; END $$; CREATE CONSTRAINT TRIGGER announce AFTER INSERT ON fixture.keyless DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION fixture.announce();").await.unwrap();
+
+    let script = db
+        .script(
+            &p.id,
+            "SELECT 1; DO $$ BEGIN RAISE NOTICE 'first step'; RAISE WARNING 'check this' USING DETAIL = 'more detail', HINT = 'a hint'; END $$; SELECT 2;",
+            "notices",
+        )
+        .await
+        .unwrap();
+    assert!(script.error.is_none(), "{:?}", script.error);
+    assert_eq!(script.statements.len(), 3);
+    assert!(script.statements.iter().all(|s| s.committed));
+    assert!(script.statements[0].messages.is_empty());
+    assert!(script.statements[2].messages.is_empty());
+    let messages = &script.statements[1].messages;
+    assert_eq!(messages.len(), 2, "{messages:?}");
+    assert_eq!(messages[0].severity, "NOTICE");
+    assert_eq!(messages[0].message, "first step");
+    assert_eq!(messages[0].detail, None);
+    assert_eq!(messages[0].hint, None);
+    assert_eq!(messages[1].severity, "WARNING");
+    assert_eq!(messages[1].message, "check this");
+    assert_eq!(messages[1].detail.as_deref(), Some("more detail"));
+    assert_eq!(messages[1].hint.as_deref(), Some("a hint"));
+
+    let block = db
+        .script(
+            &p.id,
+            "BEGIN; DO $$ BEGIN RAISE NOTICE 'inside the block'; RAISE WARNING 'still inside'; END $$; INSERT INTO fixture.keyless VALUES ('committed'); SELECT count(*) FROM fixture.keyless; COMMIT;",
+            "notices-block",
+        )
+        .await
+        .unwrap();
+    assert!(block.error.is_none(), "{:?}", block.error);
+    assert_eq!(block.statements.len(), 5);
+    assert!(block.statements.iter().all(|s| s.committed));
+    assert!(block.statements[0].messages.is_empty(), "BEGIN");
+    let raised: Vec<(&str, &str)> = block.statements[1]
+        .messages
+        .iter()
+        .map(|m| (m.severity.as_str(), m.message.as_str()))
+        .collect();
+    assert_eq!(
+        raised,
+        [("NOTICE", "inside the block"), ("WARNING", "still inside")]
+    );
+    assert!(block.statements[2].messages.is_empty(), "INSERT defers");
+    assert!(block.statements[3].messages.is_empty(), "SELECT");
+    assert_eq!(block.statements[4].command, "COMMIT");
+    assert_eq!(block.statements[4].messages.len(), 1);
+    assert_eq!(
+        block.statements[4].messages[0].message,
+        "deferred trigger for committed"
+    );
+
+    // Without an explicit COMMIT, commit-time messages belong to the statement.
+    let implicit = db
+        .script(
+            &p.id,
+            "INSERT INTO fixture.keyless VALUES ('autocommit');",
+            "notices-autocommit",
+        )
+        .await
+        .unwrap();
+    assert!(implicit.error.is_none(), "{:?}", implicit.error);
+    assert_eq!(implicit.statements.len(), 1);
+    assert_eq!(implicit.statements[0].messages.len(), 1);
+    assert_eq!(
+        implicit.statements[0].messages[0].message,
+        "deferred trigger for autocommit"
+    );
+
+    // Messages from a failed statement roll back with it and never leak into
+    // the next run.
+    let failed = db
+        .script(
+            &p.id,
+            "DO $$ BEGIN RAISE NOTICE 'before the failure'; RAISE EXCEPTION 'boom'; END $$;",
+            "notices-failed",
+        )
+        .await
+        .unwrap();
+    assert!(failed.error.unwrap().contains("boom"));
+    assert!(failed.statements.is_empty());
+    let plain = db.script(&p.id, "SELECT 1", "notices-plain").await.unwrap();
+    assert!(plain.error.is_none(), "{:?}", plain.error);
+    assert_eq!(plain.statements.len(), 1);
+    assert!(
+        plain.statements[0].messages.is_empty(),
+        "{:?}",
+        plain.statements[0].messages
+    );
+    db.disconnect(&p.id).await.unwrap();
+}

@@ -25,7 +25,7 @@ export const api = {
     const accepted = [DEFAULT_SQL, 'SELECT * FROM "public"."products" LIMIT 1000;', 'SELECT * FROM "public"."products" ORDER BY "id" LIMIT 1000;'].map(s => s.trim().replace(/;$/, '').replace(/\s+/g, ' ').toLowerCase());
     if (!accepted.includes(normalized)) throw new Error('The demo supports its sample query only. Connect to PostgreSQL to run your own SQL.');
     demoSnapshot = { id: crypto.randomUUID(), columns: demoColumns, rows: demoRows.filter(r => normalized.includes("'active'") ? r[2] === 'active' : true).map(r => [...r]), affectedRows: 0, elapsedMs: 0, truncated: false, readOnlyReason: null, table: '"public"."products"' };
-    return { statements: [{ number: 1, command: 'SELECT', affectedRows: demoSnapshot.rows.length, returnedRows: demoSnapshot.rows.length, elapsedMs: 0, committed: true }], totalStatements: 1, result: structuredClone(demoSnapshot), refreshSql: sql, error: null };
+    return { statements: [{ number: 1, command: 'SELECT', affectedRows: demoSnapshot.rows.length, returnedRows: demoSnapshot.rows.length, elapsedMs: 0, committed: true, messages: [] }], totalStatements: 1, result: structuredClone(demoSnapshot), refreshSql: sql, error: null };
   },
   cancel: (connectionId: string, operationId: string) => invoke<void>('cancel_query', { connectionId, operationId }),
   preview: async (connectionId: string, resultId: string, edits: CellEdit[]): Promise<PlannedUpdate[]> => {

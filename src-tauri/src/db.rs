@@ -13,8 +13,11 @@ use std::{
     },
     time::{Duration, Instant},
 };
-use tokio::sync::{Mutex, RwLock};
-use tokio_postgres::{types::ToSql, CancelToken, Client, Config, SimpleQueryMessage, Transaction};
+use tokio::sync::{mpsc::UnboundedReceiver, Mutex, RwLock};
+use tokio_postgres::{
+    error::DbError, types::ToSql, AsyncMessage, CancelToken, Client, Config, SimpleQueryMessage,
+    Transaction,
+};
 
 const MAX_ROWS: usize = 1000;
 const MAX_BYTES: usize = 8 * 1024 * 1024;
@@ -29,7 +32,24 @@ struct Session {
     profile: Profile,
     active: ActiveOperation,
     snapshots: Mutex<VecDeque<Snapshot>>,
+    // NOTICE and WARNING messages the driver task has received but no
+    // statement has claimed yet. Drains happen under the client lock, so the
+    // messages belong to the statement that just finished.
+    notices: SyncMutex<UnboundedReceiver<DbError>>,
     driver: tokio::task::JoinHandle<()>,
+}
+impl Session {
+    /// Takes every server message received so far, in arrival order.
+    fn messages(&self) -> Vec<ServerMessage> {
+        let Ok(mut notices) = self.notices.lock() else {
+            return Vec::new();
+        };
+        let mut messages = Vec::new();
+        while let Ok(notice) = notices.try_recv() {
+            messages.push(server_message(notice));
+        }
+        messages
+    }
 }
 impl Drop for Session {
     fn drop(&mut self) {
@@ -57,6 +77,18 @@ fn error(err: tokio_postgres::Error) -> String {
         format!("{} (PostgreSQL {})", db.message(), db.code().code())
     } else {
         format!("Database connection error: {err}")
+    }
+}
+fn server_message(notice: DbError) -> ServerMessage {
+    ServerMessage {
+        // The parsed severity is PostgreSQL's untranslated keyword; the plain
+        // field may be localized on servers older than 9.6.
+        severity: notice
+            .parsed_severity()
+            .map_or_else(|| notice.severity().to_owned(), |s| s.to_string()),
+        message: notice.message().to_owned(),
+        detail: notice.detail().map(str::to_owned),
+        hint: notice.hint().map(str::to_owned),
     }
 }
 fn tls() -> Result<MakeTlsConnector, String> {
@@ -111,6 +143,7 @@ fn statement_outcome(
     ast: &ParsedStatement,
     result: Option<&QueryResult>,
     elapsed_ms: u128,
+    messages: Vec<ServerMessage>,
 ) -> StatementOutcome {
     StatementOutcome {
         number,
@@ -119,6 +152,7 @@ fn statement_outcome(
         returned_rows: result.map_or(0, |r| r.rows.len()),
         elapsed_ms,
         committed: false,
+        messages,
     }
 }
 
@@ -147,13 +181,23 @@ impl Database {
             } else {
                 tokio_postgres::config::SslMode::Require
             });
-        let (client, connection) =
+        let (client, mut connection) =
             tokio::time::timeout(Duration::from_secs(15), config.connect(tls()?))
                 .await
                 .map_err(|_| "Connection timed out after 15 seconds.")?
                 .map_err(error)?;
+        let (notices, receiver) = tokio::sync::mpsc::unbounded_channel();
         let driver = tokio::spawn(async move {
-            let _ = connection.await;
+            // Awaiting the connection directly would log and drop every notice.
+            // Polling it message by message keeps them; the task still ends
+            // when the connection closes or fails.
+            while let Some(Ok(message)) =
+                futures_util::future::poll_fn(|cx| connection.poll_message(cx)).await
+            {
+                if let AsyncMessage::Notice(notice) = message {
+                    let _ = notices.send(notice);
+                }
+            }
         });
         client.batch_execute("SET statement_timeout = '120s'; SET lock_timeout = '5s'; SET idle_in_transaction_session_timeout = '30s'; SET standard_conforming_strings = on;").await.map_err(error)?;
         self.sessions.write().await.insert(
@@ -163,6 +207,7 @@ impl Database {
                 profile,
                 active: SyncMutex::new(None),
                 snapshots: Mutex::new(VecDeque::new()),
+                notices: SyncMutex::new(receiver),
                 driver,
             }),
         );
@@ -278,6 +323,9 @@ impl Database {
         });
         let _guard = ActiveGuard(&session.active);
         session.snapshots.lock().await.clear();
+        // Messages left over from edits, schema queries, or a failed run must
+        // not be attributed to this script's statements.
+        session.messages();
         let mut script = ScriptResult {
             total_statements: statements.len(),
             statements: Vec::new(),
@@ -323,6 +371,7 @@ impl Database {
                         &statements[index].1,
                         None,
                         start.elapsed().as_millis(),
+                        session.messages(),
                     ));
                 }
                 let body = if explicit {
@@ -339,11 +388,15 @@ impl Database {
                         let (source, ast) = &statements[i];
                         let result =
                             Self::execute_statement(&session, &tx, source, ast, &token).await?;
+                        // The driver forwards a notice before it routes the
+                        // statement's completion, so everything received by now
+                        // was raised by this statement or by the preceding BEGIN.
                         script.statements.push(statement_outcome(
                             number,
                             ast,
                             Some(&result),
                             result.elapsed_ms,
+                            session.messages(),
                         ));
                         // COMMIT must preserve the final data result. Refresh may
                         // rerun that query, but never the preceding transaction.
@@ -362,7 +415,10 @@ impl Database {
                 }
                 .await;
                 if let Err(message) = run {
-                    return match tx.rollback().await {
+                    let rolled_back = tx.rollback().await;
+                    // A failed statement has no outcome to carry its messages.
+                    session.messages();
+                    return match rolled_back {
                         Ok(()) => Err(format!(
                             "{message} The current transaction was rolled back."
                         )),
@@ -383,18 +439,25 @@ impl Database {
                         &statements[end].1,
                         None,
                         start.elapsed().as_millis(),
+                        session.messages(),
                     ));
                 } else {
                     // A deferred constraint may fail at COMMIT. Do not report
                     // any statement in the block as committed until it succeeds.
                     tx.commit().await.map_err(error)?;
+                    let messages = session.messages();
                     if explicit {
                         script.statements.push(statement_outcome(
                             number,
                             &statements[end].1,
                             None,
                             start.elapsed().as_millis(),
+                            messages,
                         ));
+                    } else if let Some(outcome) = script.statements.last_mut() {
+                        // Deferred triggers raise while committing. Without a
+                        // COMMIT of its own, the single statement owns them.
+                        outcome.messages.extend(messages);
                     }
                     for outcome in &mut script.statements[outcome_start..] {
                         outcome.committed = true;
@@ -405,6 +468,8 @@ impl Database {
             .await;
             if let Err(message) = execution {
                 session.snapshots.lock().await.clear();
+                // A failed BEGIN, COMMIT, or ROLLBACK leaves no outcome either.
+                session.messages();
                 if limited {
                     // These rows can describe writes that have just rolled back.
                     // Keep the truncated display, but never allow edits from it.
@@ -627,6 +692,9 @@ impl Database {
         }
         tx.commit().await.map_err(error)?;
         session.snapshots.lock().await.clear();
+        // Trigger notices raised by edits are not shown; drop them here so the
+        // next script does not inherit them.
+        session.messages();
         Ok(updates.len())
     }
 }

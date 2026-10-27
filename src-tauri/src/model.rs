@@ -53,6 +53,17 @@ pub struct QueryResult {
     pub table: Option<String>,
 }
 
+/// A NOTICE, WARNING, or other non-error message the server raised while a
+/// statement ran, such as `RAISE NOTICE` output from a `DO` block.
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ServerMessage {
+    pub severity: String,
+    pub message: String,
+    pub detail: Option<String>,
+    pub hint: Option<String>,
+}
+
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct StatementOutcome {
@@ -62,6 +73,7 @@ pub struct StatementOutcome {
     pub returned_rows: usize,
     pub elapsed_ms: u128,
     pub committed: bool,
+    pub messages: Vec<ServerMessage>,
 }
 
 #[derive(Debug, Serialize)]

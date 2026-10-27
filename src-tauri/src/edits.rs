@@ -1,7 +1,9 @@
 use crate::model::*;
 use bytes::BytesMut;
 use sqlparser::{
-    ast::{Expr, GroupByExpr, Query, SelectItem, SetExpr, Statement, TableFactor},
+    ast::{
+        ContextModifier, Expr, GroupByExpr, Query, SelectItem, Set, SetExpr, Statement, TableFactor,
+    },
     dialect::PostgreSqlDialect,
     keywords::Keyword,
     parser::{Parser, ParserError},
@@ -171,6 +173,9 @@ pub fn parse_script(sql: &str) -> Result<Vec<(&str, ParsedStatement)>, String> {
             Some(Statement::Commit { .. } | Statement::Rollback { .. }) => {
                 transaction_start.take().ok_or_else(|| format!("Statement {number}: COMMIT or ROLLBACK requires a preceding BEGIN in the same run. No statements were executed."))?;
             }
+            Some(stmt) if local_setting(stmt).is_some() && transaction_start.is_none() => {
+                return Err(format!("Statement {number}: SET LOCAL only applies inside a BEGIN … COMMIT block in the same run. No statements were executed."));
+            }
             _ => {}
         }
     }
@@ -180,7 +185,49 @@ pub fn parse_script(sql: &str) -> Result<Vec<(&str, ParsedStatement)>, String> {
     Ok(statements)
 }
 
+// SET LOCAL changes a setting for the current transaction only. Inside an
+// explicit block the run owns that transaction, so the setting cannot leak into
+// later runs, cell edits, or schema loads. Only the plain `SET LOCAL name = value`
+// form is accepted. Transaction characteristics belong to BEGIN's own modes, where
+// read-only connections are enforced, and role switches stay session commands.
+const TRANSACTION_SETTINGS: [&str; 5] = [
+    "transaction_read_only",
+    "transaction_isolation",
+    "transaction_deferrable",
+    "role",
+    "session_authorization",
+];
+
+fn local_setting(stmt: &Statement) -> Option<String> {
+    match stmt {
+        Statement::Set(Set::SingleAssignment {
+            scope: Some(ContextModifier::Local),
+            hivevar: false,
+            variable,
+            ..
+        }) => Some(
+            variable
+                .0
+                .iter()
+                .map(|part| {
+                    part.as_ident()
+                        .map_or_else(|| part.to_string(), |ident| ident.value.clone())
+                        .to_ascii_lowercase()
+                })
+                .collect::<Vec<_>>()
+                .join("."),
+        ),
+        _ => None,
+    }
+}
+
 fn validate_statement(stmt: &Statement) -> Result<(), String> {
+    if let Some(name) = local_setting(stmt) {
+        if TRANSACTION_SETTINGS.contains(&name.as_str()) {
+            return Err("Transaction settings and role changes are not supported as SET LOCAL. Use the modes of BEGIN (ISOLATION LEVEL, READ ONLY, DEFERRABLE) instead.".into());
+        }
+        return Ok(());
+    }
     match stmt {
         Statement::StartTransaction {
             modifier: None,
@@ -229,7 +276,7 @@ fn validate_statement(stmt: &Statement) -> Result<(), String> {
     ]
     .contains(&first.as_str())
     {
-        return Err("Session commands, COPY, and CALL are not supported yet. Transactions must use a complete BEGIN … COMMIT or BEGIN … ROLLBACK block in one run.".into());
+        return Err("Session commands, COPY, and CALL are not supported yet. SET LOCAL is accepted inside a BEGIN … COMMIT block. Transactions must use a complete BEGIN … COMMIT or BEGIN … ROLLBACK block in one run.".into());
     }
     Ok(())
 }
@@ -557,6 +604,74 @@ mod tests {
                 "{sql}: {error}"
             );
         }
+    }
+
+    #[test]
+    fn accepts_set_local_inside_transaction_blocks() {
+        let sql = "BEGIN;\nSET LOCAL lock_timeout = '3s';\nDO $$ BEGIN EXECUTE 'ALTER TABLE t DROP COLUMN IF EXISTS c'; END $$;\nCOMMIT;";
+        let statements = parse_script(sql).unwrap();
+        assert_eq!(statements.len(), 4);
+        assert_eq!(statements[1].0, "SET LOCAL lock_timeout = '3s'");
+        assert_eq!(statements[1].1.command(), "SET");
+        assert!(!can_refresh(&statements[1].1));
+        assert!(!is_plain_select(&statements[1].1));
+        for sql in [
+            "BEGIN; SET LOCAL statement_timeout TO '1min'; SELECT 1; ROLLBACK;",
+            "BEGIN; SET LOCAL search_path TO fixture, public; SELECT 1; COMMIT;",
+            "begin; set local timezone = 'UTC'; commit;",
+            "BEGIN; SET LOCAL myapp.tenant = 'acme'; COMMIT;",
+            "START TRANSACTION READ ONLY; SET LOCAL work_mem = '64MB'; SELECT 1; COMMIT;",
+            "BEGIN; SELECT 1; COMMIT; BEGIN; SET LOCAL lock_timeout = '1s'; COMMIT;",
+        ] {
+            assert!(parse_script(sql).is_ok(), "{sql}");
+        }
+    }
+
+    #[test]
+    fn rejects_set_local_outside_blocks_and_other_session_commands() {
+        for sql in [
+            "SET LOCAL lock_timeout = '3s';",
+            "SET LOCAL lock_timeout = '3s'; BEGIN; SELECT 1; COMMIT;",
+            "BEGIN; SELECT 1; COMMIT; SET LOCAL lock_timeout = '3s';",
+        ] {
+            let error = parse_script(sql).unwrap_err();
+            assert!(error.contains("inside a BEGIN"), "{sql}: {error}");
+            assert!(
+                error.contains("No statements were executed"),
+                "{sql}: {error}"
+            );
+        }
+        for sql in [
+            "BEGIN; SET LOCAL transaction_read_only = false; COMMIT;",
+            "BEGIN; SET LOCAL Transaction_Isolation = 'serializable'; COMMIT;",
+            "BEGIN; SET LOCAL \"transaction_deferrable\" TO 'on'; COMMIT;",
+            "BEGIN; SET LOCAL role = 'postgres'; COMMIT;",
+            "BEGIN; SET LOCAL session_authorization = 'postgres'; COMMIT;",
+        ] {
+            let error = parse_script(sql).unwrap_err();
+            assert!(error.contains("Transaction settings"), "{sql}: {error}");
+            assert!(
+                error.contains("No statements were executed"),
+                "{sql}: {error}"
+            );
+        }
+        for sql in [
+            "BEGIN; SET lock_timeout = '3s'; COMMIT;",
+            "BEGIN; SET SESSION lock_timeout = '3s'; COMMIT;",
+            "BEGIN; RESET lock_timeout; COMMIT;",
+            "BEGIN; SET LOCAL transaction_read_only = off; COMMIT;",
+            "BEGIN; SET LOCAL ROLE postgres; COMMIT;",
+            "BEGIN; SET LOCAL SESSION AUTHORIZATION postgres; COMMIT;",
+            "BEGIN; SET LOCAL TIME ZONE 'UTC'; COMMIT;",
+            "BEGIN; SET TRANSACTION READ WRITE; COMMIT;",
+        ] {
+            let error = parse_script(sql).unwrap_err();
+            assert!(
+                error.contains("No statements were executed"),
+                "{sql}: {error}"
+            );
+        }
+        assert!(parse_statement("SET LOCAL lock_timeout = '3s'").is_err());
     }
 
     use super::*;
